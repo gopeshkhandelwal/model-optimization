@@ -1,0 +1,7 @@
+transformers>=4.41.0
+optimum-habana>=1.14.0
+peft>=0.10.0
+torch>=2.2.0
+datasets>=2.19.0
+trl>=0.8.6
+accelerate>=0.30.0
