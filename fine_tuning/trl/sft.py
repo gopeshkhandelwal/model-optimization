@@ -70,6 +70,15 @@ class ScriptArguments:
             )
         },
     )
+    merge_adapter_after_train: bool = field(
+        default=False, metadata={"help": "If True and PEFT used, merge LoRA adapter into base model after training."}
+    )
+    merged_output_dir: Optional[str] = field(
+        default=None, metadata={"help": "Directory to save merged model (defaults to <output_dir>_merged)."}
+    )
+    merge_overwrite: bool = field(
+        default=False, metadata={"help": "If True overwrite merged_output_dir if it exists."}
+    )
 
 
 if __name__ == "__main__":
@@ -244,6 +253,37 @@ if __name__ == "__main__":
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         logger.info("[INFO] Training completed and model saved")
+        # Optional inline merge
+        if script_args.merge_adapter_after_train:
+            if not script_args.use_peft:
+                logger.warning("[MergeInline] merge_adapter_after_train=True but use_peft=False -> skipping merge")
+            else:
+                try:
+                    from peft import PeftConfig, PeftModel
+                    import os
+                    adapter_dir = training_args.output_dir
+                    peft_conf = PeftConfig.from_pretrained(adapter_dir)
+                    logger.info(f"[MergeInline] Loaded PEFT config task_type={peft_conf.task_type}")
+                    base_loader = AutoModelForCausalLM
+                    base_fresh = base_loader.from_pretrained(
+                        script_args.model_name_or_path,
+                        low_cpu_mem_usage=low_cpu_mem_usage,
+                        torch_dtype=torch.bfloat16,
+                        token=script_args.token,
+                    )
+                    merged_model = PeftModel.from_pretrained(base_fresh, adapter_dir)
+                    logger.info("[MergeInline] Adapter loaded into fresh base model; merging...")
+                    merged_model = merged_model.merge_and_unload()
+                    out_dir = script_args.merged_output_dir or f"{training_args.output_dir}_merged"
+                    if os.path.exists(out_dir) and not script_args.merge_overwrite:
+                        logger.warning(f"[MergeInline] Output dir {out_dir} exists and merge_overwrite=False -> abort merge")
+                    else:
+                        os.makedirs(out_dir, exist_ok=True)
+                        merged_model.save_pretrained(out_dir)
+                        tokenizer.save_pretrained(out_dir)
+                        logger.info(f"[MergeInline] Merged model saved to {out_dir}")
+                except Exception as e:
+                    logger.exception(f"[MergeInline] Failed to merge adapter inline: {e}")
     else:
         logger.info("[IF] do_train == False -> skipping training")
 

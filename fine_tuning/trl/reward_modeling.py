@@ -115,6 +115,15 @@ class ScriptArguments:
             )
         },
     )
+    merge_adapter_after_train: bool = field(
+        default=False, metadata={"help": "If True, merge reward model LoRA adapter into base after training."}
+    )
+    merged_output_dir: Optional[str] = field(
+        default=None, metadata={"help": "Directory to save merged reward model (defaults to <output_dir>_merged)."}
+    )
+    merge_overwrite: bool = field(
+        default=False, metadata={"help": "Overwrite merged_output_dir if it exists."}
+    )
 
 
 parser = HfArgumentParser(ScriptArguments)
@@ -298,3 +307,29 @@ trainer.save_metrics("train", metrics)
 logger.info("Saving last checkpoint of the model")
 trainer.save_model(script_args.output_dir)
 logger.info(f"[INFO] Model saved to {script_args.output_dir}")
+
+# Optional inline merge
+if script_args.merge_adapter_after_train:
+    try:
+        from peft import PeftConfig, PeftModel
+        import os
+        adapter_dir = script_args.output_dir
+        peft_conf = PeftConfig.from_pretrained(adapter_dir)
+        logger.info(f"[MergeInline] Loaded PEFT config task_type={peft_conf.task_type}")
+        # Reward model is sequence classification
+        base_model_fresh = AutoModelForSequenceClassification.from_pretrained(
+            script_args.model_name_or_path, num_labels=1, torch_dtype=torch.bfloat16
+        )
+        merged = PeftModel.from_pretrained(base_model_fresh, adapter_dir)
+        logger.info("[MergeInline] Adapter loaded into fresh base reward model; merging...")
+        merged = merged.merge_and_unload()
+        out_dir = script_args.merged_output_dir or f"{script_args.output_dir}_merged"
+        if os.path.exists(out_dir) and not script_args.merge_overwrite:
+            logger.warning(f"[MergeInline] Output dir {out_dir} exists and merge_overwrite=False -> abort merge")
+        else:
+            os.makedirs(out_dir, exist_ok=True)
+            merged.save_pretrained(out_dir)
+            tokenizer.save_pretrained(out_dir)
+            logger.info(f"[MergeInline] Merged reward model saved to {out_dir}")
+    except Exception as e:
+        logger.exception(f"[MergeInline] Failed to merge reward adapter inline: {e}")

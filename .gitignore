@@ -158,4 +158,4 @@ data/
 # =========================
 # Local development vendor / forks
 # =========================
-fine_tuning_latest/optimum-habana/*
+fine_tuning_latest/*

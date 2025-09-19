@@ -31,8 +31,7 @@ export PT_HPU_DISABLE_FUSED_ADAMW=1
 export PT_HPU_DISABLE_FUSED_ADAM=1
 export PT_HPU_ENABLE_REFINE_DYNAMIC_SHAPES=0
 
-# 1. Supervised Fine-tuning
-banner "STEP 1: Supervised Fine-Tuning (SFT)"
+banner "STEP 1: Supervised Fine-Tuning (SFT + Merge Inline)"
 time_step_begin SFT
 python sft.py \
   --model_name_or_path meta-llama/Llama-2-7b-hf \
@@ -53,20 +52,12 @@ python sft.py \
   --remove_unused_columns False \
   --report_to none \
   --use_habana \
-  --use_lazy_mode
+  --use_lazy_mode \
+  --merge_adapter_after_train \
+  --merged_output_dir ./sft_sanity_merged
 time_step_end SFT
 
-# 2. Merge SFT adapters
-banner "STEP 2: Merge SFT adapters"
-time_step_begin MERGE_SFT
-python merge_peft_adapter.py \
-  --base_model_name "meta-llama/Llama-2-7b-hf" \
-  --adapter_model_name "./sft_sanity" \
-  --output_name "./sft_sanity_merged"
-time_step_end MERGE_SFT
-
-# 3. Reward Modeling
-banner "STEP 3: Reward Modeling"
+banner "STEP 2: Reward Modeling (Inline Merge)"
 time_step_begin RM
 python reward_modeling.py \
   --model_name_or_path ./sft_sanity_merged \
@@ -81,20 +72,12 @@ python reward_modeling.py \
   --max_length 384 \
   --logging_steps 20 \
   --save_steps 999999 \
-  --bf16
+  --bf16 \
+  --merge_adapter_after_train \
+  --merged_output_dir ./rm_sanity_merged
 time_step_end RM
 
-# 4. Merge Reward Model adapters
-banner "STEP 4: Merge Reward Model adapters"
-time_step_begin MERGE_RM
-python merge_peft_adapter.py \
-  --base_model_name "meta-llama/Llama-2-7b-hf" \
-  --adapter_model_name "./rm_sanity" \
-  --output_name "./rm_sanity_merged"
-time_step_end MERGE_RM
-
-# 5. PPO Training
-banner "STEP 5: PPO Training"
+banner "STEP 3: PPO Training"
 time_step_begin PPO
 PT_HPU_LAZY_MODE=1 python ppo.py \
   --model_name_or_path ./sft_sanity_merged \
@@ -114,8 +97,7 @@ PT_HPU_LAZY_MODE=1 python ppo.py \
   --max_train_samples 256
 time_step_end PPO
 
-# 6. Run Generation (quick sanity check)
-banner "STEP 6: Run Generation"
+banner "STEP 4: Run Generation"
 time_step_begin GEN
 python run_generation.py \
   --model_name_or_path ./ppo_sanity \
@@ -133,7 +115,7 @@ echo
 echo "=================== PIPELINE TIMING SUMMARY ==================="
 printf "%-20s %10s\n" "Stage" "Seconds"
 printf "%-20s %10s\n" "-----" "-------"
-for k in SFT MERGE_SFT RM MERGE_RM PPO GEN; do
+for k in SFT RM PPO GEN; do
   printf "%-20s %10s\n" "$k" "${STEP_DURATION[$k]:-n/a}"
 done
 printf "%-20s %10s\n" "TOTAL" "$TOTAL_DUR"
