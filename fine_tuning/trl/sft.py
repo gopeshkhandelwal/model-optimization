@@ -18,6 +18,7 @@ from transformers.integrations.deepspeed import (
 from optimum.habana import GaudiConfig
 from optimum.habana.trl import GaudiSFTConfig, GaudiSFTTrainer
 from optimum.habana.utils import set_seed
+from logging_utils import setup_logging
 
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,11 @@ class ScriptArguments:
 if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, GaudiSFTConfig))
     script_args, training_args = parser.parse_args_into_dataclasses()
+    setup_logging()
+    logger.info(f"ScriptArguments: {script_args}")
+    logger.info(f"TrainingArguments: {training_args}")
     if script_args.use_peft:
+        logger.info("[IF] use_peft == True -> configuring LoRA")
         peft_config = LoraConfig(
             r=script_args.lora_r,
             lora_alpha=script_args.lora_alpha,
@@ -84,9 +89,11 @@ if __name__ == "__main__":
             task_type="CAUSAL_LM",
         )
     else:
+        logger.info("[IF] use_peft == False -> full fine-tune (no LoRA)")
         peft_config = None
 
     if training_args.group_by_length and training_args.packing:
+        logger.warning("[IF] group_by_length AND packing are both True -> raising ValueError")
         raise ValueError("Cannot use both packing and group by length")
 
     set_seed(training_args.seed)
@@ -113,6 +120,7 @@ if __name__ == "__main__":
 
     def create_datasets(tokenizer, args, seed=None):
         if args.dataset_name:
+            logger.info(f"[IF] dataset_name provided -> loading {args.dataset_name}")
             dataset = load_dataset(
                 args.dataset_name,
                 data_dir=None if args.subset == "None" else args.subset,
@@ -122,30 +130,37 @@ if __name__ == "__main__":
                 streaming=args.streaming,
             )
         else:
+            logger.error("[IF] dataset_name missing -> raising ValueError")
             raise ValueError("No dataset_name")
         if args.streaming:
+            logger.info("[IF] streaming == True -> using .take/.skip and shuffle")
             logger.info("Loading the dataset in streaming mode")
             valid_data = dataset.take(args.size_valid_set)
             train_data = dataset.skip(args.size_valid_set)
             train_data = train_data.shuffle(buffer_size=args.shuffle_buffer, seed=seed)
         else:
+            logger.info("[IF] streaming == False -> train_test_split path")
             dataset = dataset.train_test_split(test_size=args.validation_split_percentage * 0.01, seed=seed)
             train_data = dataset["train"]
             valid_data = dataset["test"]
             logger.info(f"Size of the train set: {len(train_data)}. Size of the validation set: {len(valid_data)}")
         if args.dataset_name == "lvwerra/stack-exchange-paired":
+            logger.info("[IF] dataset_name is stack-exchange-paired -> computing chars/token ratio and formatting func")
             chars_per_token = chars_token_ratio(train_data, tokenizer)
             logger.info(f"The character to token ratio of the dataset is: {chars_per_token:.2f}")
             formating_func = prepare_sample_text
         else:
+            logger.info("[IF] dataset_name is NOT stack-exchange-paired -> no formatting func")
             formating_func = None
         return train_data, valid_data, formating_func
 
     low_cpu_mem_usage = True
     if is_deepspeed_available():
+        logger.info("[IF] Deepspeed available -> checking Zero3")
         from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 
         if is_deepspeed_zero3_enabled():
+            logger.info("[IF] DeepSpeed Zero3 enabled -> disabling low_cpu_mem_usage")
             low_cpu_mem_usage = False
 
     base_model = AutoModelForCausalLM.from_pretrained(
@@ -155,14 +170,34 @@ if __name__ == "__main__":
         token=script_args.token,
     )
 
+    # --- Parameter statistics before (and later after) PEFT injection ---
+    def _param_stats(model):
+        total = 0
+        trainable = 0
+        for p in model.parameters():
+            n = p.numel()
+            total += n
+            if p.requires_grad:
+                trainable += n
+        pct = (trainable / total * 100) if total else 0.0
+        return total, trainable, pct
+
+    tot, trn, pct = _param_stats(base_model)
+    logger.info(f"[Model Params][Base] total={tot:,} trainable={trn:,} ({pct:.4f}%)")
+
     base_model.config.use_cache = False
     if not script_args.use_flash_attention and (
         script_args.flash_attention_recompute or script_args.flash_attention_recompute
     ):
+        logger.warning("[IF] flash attention recompute flags set while use_flash_attention is False -> assert")
         assert "Need to enable use_flash_attention"
     base_model.generation_config.use_flash_attention = script_args.use_flash_attention
     base_model.generation_config.flash_attention_recompute = script_args.flash_attention_recompute
     base_model.generation_config.flash_attention_causal_mask = script_args.flash_attention_causal_mask
+    if script_args.use_flash_attention:
+        logger.info("[IF] use_flash_attention == True -> flash attention settings applied")
+    else:
+        logger.info("[IF] use_flash_attention == False -> skipping flash attention optimizations")
 
     tokenizer = AutoTokenizer.from_pretrained(script_args.model_name_or_path, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
@@ -180,6 +215,7 @@ if __name__ == "__main__":
     gaudi_config.use_fused_adam = False
     gaudi_config.use_fused_clip_norm = False
     if training_args.do_train:
+        logger.info("[IF] do_train == True -> beginning training loop")
         trainer = GaudiSFTTrainer(
             model=base_model,
             gaudi_config=gaudi_config,
@@ -191,14 +227,29 @@ if __name__ == "__main__":
             formatting_func=formatting_func,
             num_buckets=script_args.num_buckets,
         )
+
+        # If PEFT active, trainer.model now wrapped; print updated stats
+        try:
+            wrapped_tot, wrapped_trn, wrapped_pct = _param_stats(trainer.model)
+            logger.info(f"[Model Params][After Trainer Init] total={wrapped_tot:,} trainable={wrapped_trn:,} ({wrapped_pct:.4f}%)")
+            if peft_config is not None:
+                # Highlight LoRA target modules used
+                logger.info(f"[LoRA] Target modules: {peft_config.target_modules}")
+                logger.info(f"[LoRA] r={getattr(peft_config,'r',None)} alpha={getattr(peft_config,'lora_alpha',None)} dropout={getattr(peft_config,'lora_dropout',None)}")
+        except Exception as e:
+            logger.warning(f"[Warn] Could not compute PEFT parameter stats: {e}")
         train_result = trainer.train()
         trainer.save_model(training_args.output_dir)
         metrics = train_result.metrics
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
+        logger.info("[INFO] Training completed and model saved")
+    else:
+        logger.info("[IF] do_train == False -> skipping training")
 
     # Evaluation
     if training_args.do_eval:
+        logger.info("[IF] do_eval == True -> running evaluation")
         logger.info("*** Evaluate ***")
         metrics = trainer.evaluate()
         if isinstance(eval_dataset, torch.utils.data.IterableDataset):
@@ -214,3 +265,6 @@ if __name__ == "__main__":
 
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
+        logger.info("[INFO] Evaluation complete")
+    else:
+        logger.info("[IF] do_eval == False -> skipping evaluation")

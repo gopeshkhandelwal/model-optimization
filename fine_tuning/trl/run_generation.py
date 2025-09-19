@@ -1,4 +1,5 @@
 import argparse, torch
+import logging
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 def main():
@@ -14,21 +15,28 @@ def main():
     ap.add_argument("--top_p", type=float, default=0.9)
     ap.add_argument("--top_k", type=int, default=0)
     args = ap.parse_args()
+    from logging_utils import setup_logging
+    setup_logging()
+    logger = logging.getLogger(__name__)
+    logger.info(f"Args: {args}")
 
     dtype = torch.bfloat16 if args.bf16 else torch.float32
     device = torch.device("hpu" if hasattr(torch, "hpu") and torch.hpu.is_available() else "cpu")
 
     tok = AutoTokenizer.from_pretrained(args.model_name_or_path)
     if tok.pad_token is None:
+        logger.info("[IF] tokenizer.pad_token is None -> setting to eos_token")
         tok.pad_token = tok.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=dtype)
     model.to(device)
     model.eval()
+    logger.info(f"[Model] Loaded {args.model_name_or_path} to {device} dtype={dtype}")
 
     # Batch prompts (repeat/crop to batch_size)
     prompts = args.prompt
     if len(prompts) < args.batch_size:
+        logger.info(f"[IF] Provided {len(prompts)} prompts < batch_size {args.batch_size} -> repeating prompts")
         prompts += prompts * ((args.batch_size + len(prompts) - 1) // len(prompts))
     prompts = prompts[:args.batch_size]
 
@@ -44,6 +52,7 @@ def main():
     )
     if args.top_k and args.top_k > 0:
         gen_kwargs["top_k"] = args.top_k
+    logger.info(f"[Generate] Generation kwargs: {gen_kwargs}")
 
     with torch.inference_mode():
         out = model.generate(**inputs, **gen_kwargs)
@@ -51,6 +60,7 @@ def main():
     for i, o in enumerate(out):
         print(f"\n=== Sample {i} ===")
         print(tok.decode(o, skip_special_tokens=True))
+    logger.info("[Done] Generation complete")
 
 if __name__ == "__main__":
     main()

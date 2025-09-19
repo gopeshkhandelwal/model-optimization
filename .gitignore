@@ -1,0 +1,161 @@
+# =========================
+# Global / Editor / OS
+# =========================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*.orig
+
+# =========================
+# Python Bytecode / Caches
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Environment / Virtualenv
+# =========================
+.env
+.env.*
+.venv/
+venv/
+.envrc
+pip-wheel-metadata/
+
+# =========================
+# Packaging / Build Artifacts
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+wheelhouse/
+
+# =========================
+# Test / Coverage / Benchmark
+# =========================
+.pytest_cache/
+.coverage*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+benchmarks/.results/
+
+# =========================
+# Jupyter / Notebooks
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Logs / Reports / Temp
+# =========================
+logs/
+*.log
+*.out
+*.err
+nohup.out
+profile.prof
+*.tmp
+.tmp/
+/tmp/
+
+# =========================
+# Model / Training Artifacts (large)
+# (Uncomment specific lines if you WANT to version them.)
+# =========================
+# Common HF / Transformers outputs
+checkpoint*/
+checkpoints/
+outputs/
+runs/
+wandb/
+lightning_logs/
+
+# Large model weight & optimizer snapshots
+*.bin
+*.pt
+*.safetensors
+*.h5
+*.ckpt
+optimizer.pt
+scheduler.pt
+pytorch_model.bin
+pytorch_model*.bin
+trainer_state.json
+
+# LoRA / PEFT intermediate adapters (keep final merged if desired)
+*adapter_model.bin
+*adapter_config.json
+
+# =========================
+# Hugging Face / Caches
+# =========================
+.huggingface/
+.cache/
+# If you mount HF cache explicitly under project root; otherwise it's typically in $HOME/.cache
+huggingface/
+
+# =========================
+# Habana / Gaudi Specific
+# =========================
+habana_logs/
+habana_profile*/
+core.*
+
+# =========================
+# Generated Comparison / Analysis Artifacts
+# =========================
+compare_results.json
+training_args.json
+
+# =========================
+# Shell / Scripts
+# =========================
+*.sh.history
+
+# =========================
+# Security / Secrets (never commit)
+# =========================
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+*.der
+*.cer
+*.req
+.secrets*
+secret*/
+
+# =========================
+# Misc Tooling
+# =========================
+.cache-
+.pyre/
+
+# =========================
+# Local data samples (place raw datasets elsewhere)
+# =========================
+data/
+*.parquet
+*.csv
+*.jsonl
+
+# =========================
+# Allowlist (negate ignores) - uncomment as needed
+# =========================
+#!compare_results.json   # Keep a single canonical comparison output
+#!config/                # Keep configuration files
+
+# =========================
+# Local development vendor / forks
+# =========================
+fine_tuning_latest/optimum-habana/*

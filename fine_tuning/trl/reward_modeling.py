@@ -2,6 +2,7 @@
 # Customized and enabled for Gaudi3
 
 from dataclasses import dataclass, field
+import logging
 from typing import List, Optional
 
 import evaluate
@@ -117,14 +118,20 @@ class ScriptArguments:
 
 
 parser = HfArgumentParser(ScriptArguments)
+from logging_utils import setup_logging
 script_args = parser.parse_args_into_dataclasses()[0]
+setup_logging()
+logger = logging.getLogger(__name__)
+logger.info(f"ScriptArguments: {script_args}")
 set_seed(script_args.seed)
 # Load the human stack-exchange-paired dataset for tuning the reward model.
 train_dataset = load_dataset("lvwerra/stack-exchange-paired", data_dir="data/reward", split="train")
 if script_args.train_subset > 0:
+    logger.info(f"[IF] train_subset > 0 -> selecting first {script_args.train_subset} samples")
     train_dataset = train_dataset.select(range(script_args.train_subset))
 eval_dataset = load_dataset("lvwerra/stack-exchange-paired", data_dir="data/evaluation", split="train")
 if script_args.eval_subset > 0:
+    logger.info(f"[IF] eval_subset > 0 -> selecting first {script_args.eval_subset} samples")
     eval_dataset = eval_dataset.select(range(script_args.eval_subset))
 # Define the training args. Needs to be done before the model is loaded if you are using deepspeed.
 
@@ -155,6 +162,7 @@ training_args = GaudiTrainingArguments(
     use_lazy_mode=True,
     seed=script_args.seed,
 )
+logger.info(f"TrainingArguments: {training_args}")
 
 # Load the value-head model and tokenizer.
 tokenizer_name = (
@@ -176,9 +184,18 @@ torch.autograd.set_detect_anomaly(True)
 model = AutoModelForSequenceClassification.from_pretrained(
     script_args.model_name_or_path, num_labels=1, torch_dtype=torch.bfloat16
 )
+logger.info("[Model] Base sequence classification model loaded")
+
+def _param_stats(m):
+    tot=trn=0
+    for p in m.parameters():
+        n=p.numel(); tot+=n; trn+= n if p.requires_grad else 0
+    return tot,trn,(trn/tot*100 if tot else 0)
 
 model = get_peft_model(model, peft_config)
 model.print_trainable_parameters()
+tot,trn,pct=_param_stats(model)
+logger.info(f"[Model Params][After LoRA] total={tot:,} trainable={trn:,} ({pct:.4f}%)")
 # Need to do this for gpt2, because it doesn't have an official pad token.
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
@@ -220,6 +237,7 @@ train_dataset = train_dataset.map(
 train_dataset = train_dataset.filter(
     lambda x: len(x["input_ids_j"]) <= script_args.max_length and len(x["input_ids_k"]) <= script_args.max_length
 )
+logger.info(f"[Filter] Train dataset length after length filter: {len(train_dataset)}")
 
 eval_dataset = eval_dataset.map(
     preprocess_function,
@@ -230,6 +248,7 @@ eval_dataset = eval_dataset.map(
 eval_dataset = eval_dataset.filter(
     lambda x: len(x["input_ids_j"]) <= script_args.max_length and len(x["input_ids_k"]) <= script_args.max_length
 )
+logger.info(f"[Filter] Eval dataset length after length filter: {len(eval_dataset)}")
 
 # Define the metric that we'll use for validation.
 accuracy = evaluate.load("accuracy")
@@ -237,9 +256,7 @@ accuracy = evaluate.load("accuracy")
 
 def compute_metrics(eval_pred):
     predictions, _ = eval_pred
-    # Here, predictions is rewards_j and rewards_k.
-    # We want to see how much of the time rewards_j > rewards_k.
-    predictions = np.argmax(predictions, axis=0)
+    predictions = np.argmax(predictions, axis=1)
     labels = np.zeros(predictions.shape)
     return accuracy.compute(predictions=predictions, references=labels)
 
@@ -263,6 +280,7 @@ trainer = GaudiRewardTrainer(
 
 
 if script_args.eval_first_step:
+    logger.info("[IF] eval_first_step == True -> enabling first-step evaluation callback")
 
     class EvaluateFirstStepCallback(TrainerCallback):
         def on_step_end(self, args, state, control, **kwargs):
@@ -272,9 +290,11 @@ if script_args.eval_first_step:
     trainer.add_callback(EvaluateFirstStepCallback())
 
 train_result = trainer.train(script_args.resume_from_checkpoint)
+logger.info("[INFO] Training finished")
 metrics = train_result.metrics
 trainer.log_metrics("train", metrics)
 trainer.save_metrics("train", metrics)
 
-print("Saving last checkpoint of the model")
+logger.info("Saving last checkpoint of the model")
 trainer.save_model(script_args.output_dir)
+logger.info(f"[INFO] Model saved to {script_args.output_dir}")

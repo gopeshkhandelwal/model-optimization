@@ -2,6 +2,7 @@
 # Customized and enabled for Gaudi3
 import json
 import time
+import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -83,7 +84,11 @@ class ScriptArguments:
 
 adapt_PreTrainedModelWrapper_to_gaudi()
 parser = HfArgumentParser(ScriptArguments)
+from logging_utils import setup_logging
 script_args: ScriptArguments = parser.parse_args_into_dataclasses()[0]
+setup_logging()
+logger = logging.getLogger(__name__)
+logger.info(f"ScriptArguments: {script_args}")
 reward_model_name = script_args.reward_model_name
 dataset_name = "lvwerra/stack-exchange-paired"
 config = GaudiPPOConfig(
@@ -105,9 +110,11 @@ config = GaudiPPOConfig(
     pad_max_len=script_args.input_max_length + script_args.output_max_length,
     pad_max_input_len=script_args.input_max_length,
 )
+logger.info(f"GaudiPPOConfig: {config}")
 
 train_dataset = load_dataset("lvwerra/stack-exchange-paired", data_dir="data/rl", split="train")
 if script_args.max_train_samples is not None:
+    logger.info(f"[IF] max_train_samples specified -> limiting to {script_args.max_train_samples}")
     max_train_samples = min(len(train_dataset), script_args.max_train_samples)
     train_dataset = train_dataset.select(range(max_train_samples))
 original_columns = train_dataset.column_names
@@ -121,6 +128,7 @@ sent_kwargs = {
     "truncation": True,
 }
 if config.pad_for_acceleration:
+    logger.info("[IF] pad_for_acceleration == True -> enabling padding in sentiment kwargs")
     sent_kwargs["padding"] = "max_length"
     sent_kwargs["max_length"] = script_args.input_max_length + script_args.output_max_length
 
@@ -129,6 +137,7 @@ tokenizer = AutoTokenizer.from_pretrained(script_args.tokenizer_name_or_path)
 # only for this model.
 
 if getattr(tokenizer, "pad_token", None) is None:
+    logger.info("[IF] tokenizer.pad_token is None -> assigning eos_token as pad_token")
     tokenizer.pad_token = tokenizer.eos_token
 
 
@@ -175,6 +184,7 @@ def build_dataset(
         remove_columns=original_columns,
     )
     ds = ds.filter(lambda x: len(x["input_ids"]) < input_max_length, batched=False)
+    logger.info(f"[Dataset] Filtered dataset length: {len(ds)}")
 
     ds.set_format(type="torch")
     return ds
@@ -201,6 +211,7 @@ lora_config = LoraConfig(
     bias="none",
     task_type="CAUSAL_LM",
 )
+logger.info(f"[LoRA] Config: {lora_config}")
 model = AutoModelForCausalLMWithValueHead.from_pretrained(
     config.model_name,
     peft_config=lora_config,
@@ -212,15 +223,26 @@ model.config.use_fused_rms_norm = False
 optimizer = None
 model = model.to(torch.bfloat16)
 
+def _param_stats(m):
+    tot=trn=0
+    for p in m.parameters():
+        n=p.numel(); tot+=n; trn+= n if p.requires_grad else 0
+    return tot,trn,(trn/tot*100 if tot else 0)
+btot,btrn,bpct=_param_stats(model)
+logger.info(f"[Model Params][Policy+ValueHead] total={btot:,} trainable={btrn:,} ({bpct:.4f}%)")
+
 if script_args.use_habana:
+    logger.info("[IF] use_habana == True -> loading reference model")
     ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
         config.model_name,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
 else:
+    logger.info("[IF] use_habana == False -> no reference model (reference-free mode)")
     ref_model = None
 if script_args.adafactor:
+    logger.info("[IF] adafactor == True -> using Adafactor optimizer")
     optimizer = Adafactor(
         filter(lambda p: p.requires_grad, model.parameters()),
         scale_parameter=False,
@@ -238,6 +260,7 @@ ppo_trainer = GaudiPPOTrainer(
     data_collator=collator,
     optimizer=optimizer,
 )
+logger.info("[Trainer] PPO trainer initialized")
 # We then build the sentiment analysis pipeline using our reward model, passing the
 # model name and the sentiment analysis pipeline arguments. Let's also make sure to
 # set the device to the same device as the PPOTrainer.
@@ -248,11 +271,13 @@ reward_model = AutoModelForSequenceClassification.from_pretrained(
     num_labels=1,
     low_cpu_mem_usage=True,
 )
+logger.info(f"[RewardModel] Loaded reward model: {reward_model_name}")
 
 if config.use_habana:
     from habana_frameworks.torch.hpu import wrap_in_hpu_graph
 
     reward_model = wrap_in_hpu_graph(reward_model)
+    logger.info("[IF] use_habana == True -> reward model wrapped in HPU graph")
 
 if device.type == "hpu":
     device = "hpu"
@@ -292,6 +317,7 @@ s0 = time.time()
 sample = 0
 for epoch, batch in tqdm(enumerate(ppo_trainer.dataloader)):
     if epoch >= config.total_ppo_epochs:
+        logger.info("[Loop] Reached total_ppo_epochs -> breaking loop")
         break
     question_tensors = batch["input_ids"]
     sample = sample + len(question_tensors)
@@ -307,12 +333,15 @@ for epoch, batch in tqdm(enumerate(ppo_trainer.dataloader)):
     texts = [q + r for q, r in zip(batch["query"], batch["response"])]
     pipe_outputs = sentiment_pipe(texts, **sent_kwargs)
     rewards = [torch.tensor(output[0]["score"] - script_args.reward_baseline) for output in pipe_outputs]
+    if epoch % 10 == 0:
+        logger.info(f"[Loop] Epoch {epoch} sample reward: {rewards[0].item():.4f}")
 
     # Run PPO step
     stats = ppo_trainer.step(question_tensors, response_tensors, rewards)
     ppo_trainer.log_stats(stats, batch, rewards)
 
     if script_args.save_freq and epoch and epoch % script_args.save_freq == 0:
+        logger.info(f"[IF] save_freq condition met at epoch {epoch} -> saving intermediate model")
         ppo_trainer.save_pretrained(script_args.output_dir + f"step_{epoch}")
 s1 = time.time()
 
@@ -320,3 +349,4 @@ ppo_trainer.save_pretrained(script_args.output_dir)
 metrics = {"train_runtime": s1 - s0, "train_samples_per_second": sample / (s1 - s0)}
 with open(f"{script_args.output_dir}/all_results.json", mode="w") as file:
     json.dump(metrics, file)
+logger.info("[INFO] PPO training complete. Metrics saved.")
