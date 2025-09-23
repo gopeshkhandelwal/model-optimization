@@ -97,16 +97,16 @@ PT_HPU_LAZY_MODE=1 python ppo.py \
   --max_train_samples 256
 time_step_end PPO
 
-banner "STEP 4: Run Generation"
-time_step_begin GEN
-python run_generation.py \
-  --model_name_or_path ./ppo_sanity \
-  --prompt "What is the currency of the USA?" \
-  --bf16 \
-  --use_kv_cache \
-  --max_new_tokens 64 \
-  --batch_size 1
-time_step_end GEN
+banner "STEP 4: Comparing Base and PPO Models"
+time_step_begin COMPARE
+PT_HPU_LAZY_MODE=1 python compare_base_vs_ppo.py \
+  --base_model meta-llama/Llama-2-7b-hf \
+  --finetuned_model ./ppo_sanity \
+  --reward_model ./rm_sanity_merged \
+  --dataset_name lvwerra/stack-exchange-paired \
+  --dataset_split train_prefs \
+  --num_samples 5
+time_step_end COMPARE
 
 PIPELINE_END=$(date +%s)
 TOTAL_DUR=$(( PIPELINE_END - START_PIPELINE ))
@@ -115,7 +115,7 @@ echo
 echo "=================== PIPELINE TIMING SUMMARY ==================="
 printf "%-20s %10s\n" "Stage" "Seconds"
 printf "%-20s %10s\n" "-----" "-------"
-for k in SFT RM PPO GEN; do
+for k in SFT RM PPO COMPARE; do
   printf "%-20s %10s\n" "$k" "${STEP_DURATION[$k]:-n/a}"
 done
 printf "%-20s %10s\n" "TOTAL" "$TOTAL_DUR"

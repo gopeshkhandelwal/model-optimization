@@ -71,7 +71,7 @@ class ScriptArguments:
         },
     )
     merge_adapter_after_train: bool = field(
-        default=False, metadata={"help": "If True and PEFT used, merge LoRA adapter into base model after training."}
+        default=True, metadata={"help": "If True and PEFT used, merge LoRA adapter into base model after training."}
     )
     merged_output_dir: Optional[str] = field(
         default=None, metadata={"help": "Directory to save merged model (defaults to <output_dir>_merged)."}
