@@ -103,9 +103,8 @@ PT_HPU_LAZY_MODE=1 python compare_base_vs_ppo.py \
   --base_model meta-llama/Llama-2-7b-hf \
   --finetuned_model ./ppo_sanity \
   --reward_model ./rm_sanity_merged \
-  --dataset_name lvwerra/stack-exchange-paired \
-  --dataset_split train_prefs \
-  --num_samples 5
+  --seed 123 \
+  --greedy
 time_step_end COMPARE
 
 PIPELINE_END=$(date +%s)

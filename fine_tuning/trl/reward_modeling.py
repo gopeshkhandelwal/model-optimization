@@ -264,17 +264,20 @@ accuracy = evaluate.load("accuracy")
 
 
 def compute_metrics(eval_pred):
+    """col0 = preferred, col1 = non-preferred. r_j, r_k, r_j, r_k, …)"""
     predictions, _ = eval_pred
-    predictions = np.argmax(predictions, axis=1)
-    labels = np.zeros(predictions.shape)
-    return accuracy.compute(predictions=predictions, references=labels)
+    preds = np.asarray(predictions)
+    chosen = preds[:, 0]
+    rejected = preds[:, 1]
+    acc = float((chosen > rejected).mean()) if len(chosen) else 0.0
+    return {"pairwise_accuracy": acc}
 
 
 gaudi_config = GaudiConfig()
 gaudi_config.use_fused_adam = False
 gaudi_config.use_fused_clip_norm = False
 
-# Train the model, woohoo.
+# Train the model
 trainer = GaudiRewardTrainer(
     model=model,
     gaudi_config=gaudi_config,

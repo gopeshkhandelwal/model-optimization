@@ -85,9 +85,7 @@ if args.prompts_file and Path(args.prompts_file).is_file():
 else:
     prompts = [
         "Why do programmers prefer Python over Java for machine learning?",
-        "What is the difference between supervised and unsupervised learning?",
         "What are the advantages of Docker for deploying applications?",
-        "Why does gradient descent work even though it doesn’t always find the global minimum?",
     ]
     logger.info(f"[Prompts] Using default {len(prompts)} hard-coded prompts")
 
