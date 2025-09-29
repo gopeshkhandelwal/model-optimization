@@ -124,6 +124,8 @@ script_args: ScriptArguments = parser.parse_args_into_dataclasses()[0]
 setup_logging()
 logger = logging.getLogger(__name__)
 logger.info(f"ScriptArguments: {script_args}")
+if not (hasattr(torch, 'hpu') and torch.hpu.is_available()):
+    raise RuntimeError('[HPU][Required] Habana HPU not available. PPO script enforces HPU-only execution.')
 # Always force HPU usage regardless of CLI flag (user request: Always Use HPU)
 if not script_args.use_habana:
     logger.warning("[HPU][Override] Forcing use_habana=True (Always Use HPU policy)")

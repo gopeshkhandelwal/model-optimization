@@ -77,8 +77,10 @@ logger.info(
     f"[Init] base_model={base_model} ppo_model={ppo_model} reward_model_path={reward_model_path} seed={args.seed}"
 )
 
-device = "hpu" if hasattr(torch, "hpu") else ("cuda" if torch.cuda.is_available() else "cpu")
-logger.info(f"[Device] Using device={device}")
+if not (hasattr(torch, "hpu") and torch.hpu.is_available()):
+    raise RuntimeError("[HPU][Required] Habana HPU not available. Comparison script requires HPU (no CPU fallback).")
+device = "hpu"
+logger.info(f"[Device] Using enforced device={device}")
 
 # Prompts
 if args.prompts_file and Path(args.prompts_file).is_file():
@@ -260,7 +262,7 @@ def load_causal(path: str):
     logger.info(f"[ModelLoad] Loading causal LM: {path}")
     m = AutoModelForCausalLM.from_pretrained(
         path,
-        torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
+        torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
     m.to(device)

@@ -21,17 +21,31 @@ def main():
     logger.info(f"Args: {args}")
 
     dtype = torch.bfloat16 if args.bf16 else torch.float32
-    device = torch.device("hpu" if hasattr(torch, "hpu") and torch.hpu.is_available() else "cpu")
+    if not (hasattr(torch, "hpu") and torch.hpu.is_available()):
+        raise RuntimeError("[HPU][Required] Habana HPU not available. This script is configured to always use Gaudi/HPU.")
+    device = torch.device("hpu")
 
     tok = AutoTokenizer.from_pretrained(args.model_name_or_path)
     if tok.pad_token is None:
         logger.info("[IF] tokenizer.pad_token is None -> setting to eos_token")
         tok.pad_token = tok.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=dtype)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=dtype, low_cpu_mem_usage=True)
+    mt = getattr(model.config, 'model_type', '')
+    if mt.startswith('gemma3'):
+        try:
+            model.config.use_cache = args.use_kv_cache  # allow override
+            # Prefer eager attn for gemma3 stability
+            if getattr(model.config, 'attn_implementation', None) is not None:
+                model.config.attn_implementation = 'eager'
+        except Exception:
+            pass
+    else:
+        # For Llama keep cache flag user-specified
+        model.config.use_cache = args.use_kv_cache
     model.to(device)
     model.eval()
-    logger.info(f"[Model] Loaded {args.model_name_or_path} to {device} dtype={dtype}")
+    logger.info(f"[Model] Loaded {args.model_name_or_path} (type={mt}) to {device} dtype={dtype}")
 
     # Batch prompts (repeat/crop to batch_size)
     prompts = args.prompt

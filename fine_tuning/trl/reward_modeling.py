@@ -134,6 +134,8 @@ script_args = parser.parse_args_into_dataclasses()[0]
 setup_logging()
 logger = logging.getLogger(__name__)
 logger.info(f"ScriptArguments: {script_args}")
+if not (hasattr(torch, 'hpu') and torch.hpu.is_available()):
+    raise RuntimeError('[HPU][Required] Habana HPU not available. Reward modeling enforces HPU-only execution.')
 set_seed(script_args.seed)
 # Load the human stack-exchange-paired dataset for tuning the reward model.
 train_dataset = load_dataset("lvwerra/stack-exchange-paired", data_dir="data/reward", split="train")
@@ -221,6 +223,12 @@ except ValueError as e:
     base_lm = AutoModelForCausalLM.from_pretrained(
         script_args.model_name_or_path, torch_dtype=torch.bfloat16, output_hidden_states=True
     )
+    mt = getattr(base_lm.config, 'model_type', '')
+    if mt.startswith('gemma3'):
+        try:
+            base_lm.config.attn_implementation = 'eager'
+        except Exception:
+            pass
     hidden_size = getattr(base_lm.config, 'hidden_size', getattr(base_lm.config, 'model_dim', None))
     if hidden_size is None:
         raise RuntimeError("Could not infer hidden size from Gemma config for reward head")
