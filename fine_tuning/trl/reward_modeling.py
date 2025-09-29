@@ -48,13 +48,13 @@ class ScriptArguments:
     learning_rate: Optional[float] = field(default=2e-5)
     weight_decay: Optional[float] = field(default=0.001)
     model_name_or_path: Optional[str] = field(
-    default="google/gemma-3-270m",
+    default=None,
         metadata={
             "help": "The model that you want to train from the Hugging Face hub. E.g. gpt2, gpt2-xl, bert, etc."
         },
     )
     tokenizer_name_or_path: Optional[str] = field(
-    default="google/gemma-3-270m",
+    default=None,
         metadata={
             "help": "The tokenizer for your model, if left empty will use the default for your model",
         },
@@ -134,6 +134,10 @@ script_args = parser.parse_args_into_dataclasses()[0]
 setup_logging()
 logger = logging.getLogger(__name__)
 logger.info(f"ScriptArguments: {script_args}")
+if not script_args.model_name_or_path:
+    raise ValueError("--model_name_or_path is required (no default). Provide a model path or repo id.")
+if script_args.tokenizer_name_or_path is None:
+    script_args.tokenizer_name_or_path = script_args.model_name_or_path
 if not (hasattr(torch, 'hpu') and torch.hpu.is_available()):
     raise RuntimeError('[HPU][Required] Habana HPU not available. Reward modeling enforces HPU-only execution.')
 set_seed(script_args.seed)

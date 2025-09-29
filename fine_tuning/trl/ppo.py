@@ -32,9 +32,9 @@ class ScriptArguments:
 
     # NOTE: gpt2 models use Conv1D instead of Linear layers which are not yet supported in 8 bit mode
     # models like gpt-neo* models are more suitable.
-    model_name_or_path: Optional[str] = field(default="google/gemma-3-270m", metadata={"help": "the (Gemma 3) model name"})
+    model_name_or_path: Optional[str] = field(default=None, metadata={"help": "Path or HF repo id of base policy model (required)."})
     tokenizer_name_or_path: Optional[str] = field(
-    default="google/gemma-3-270m", metadata={"help": "the tokenizer name (Gemma 3)"}
+    default=None, metadata={"help": "Optional tokenizer path (defaults to model_name_or_path)."}
     )
     reward_model_name: Optional[str] = field(default="", metadata={"help": "the reward model name"})
     log_with: Optional[str] = field(default=None, metadata={"help": "use 'wandb' to log with wandb"})
@@ -124,6 +124,10 @@ script_args: ScriptArguments = parser.parse_args_into_dataclasses()[0]
 setup_logging()
 logger = logging.getLogger(__name__)
 logger.info(f"ScriptArguments: {script_args}")
+if not script_args.model_name_or_path:
+    raise ValueError("--model_name_or_path is required (no default). Provide a model path or repo id.")
+if not script_args.tokenizer_name_or_path:
+    script_args.tokenizer_name_or_path = script_args.model_name_or_path
 if not (hasattr(torch, 'hpu') and torch.hpu.is_available()):
     raise RuntimeError('[HPU][Required] Habana HPU not available. PPO script enforces HPU-only execution.')
 # Always force HPU usage regardless of CLI flag (user request: Always Use HPU)

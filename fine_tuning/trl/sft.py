@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ScriptArguments:
-    model_name_or_path: Optional[str] = field(default="google/gemma-3-270m", metadata={"help": "the (Gemma 3) model name"})
+    model_name_or_path: Optional[str] = field(default=None, metadata={"help": "Path or HF repo id of base SFT model (required)."})
     dataset_name: Optional[str] = field(default=None, metadata={"help": "the dataset name"})
     use_peft: Optional[bool] = field(default=True, metadata={"help": "whether to use peft"})
     subset: Optional[str] = field(default="data/finetune", metadata={"help": "the subset to use"})
@@ -84,6 +84,8 @@ class ScriptArguments:
 if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, GaudiSFTConfig))
     script_args, training_args = parser.parse_args_into_dataclasses()
+    if not script_args.model_name_or_path:
+        raise ValueError("--model_name_or_path is required (no default). Provide a model path or repo id.")
     if not (hasattr(torch, 'hpu') and torch.hpu.is_available()):
         raise RuntimeError('[HPU][Required] Habana HPU not available. SFT script enforces HPU-only execution.')
     if getattr(training_args, 'use_habana', False) is False:
