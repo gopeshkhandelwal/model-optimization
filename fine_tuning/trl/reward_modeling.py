@@ -15,7 +15,9 @@ from transformers import (
     AutoTokenizer,
     HfArgumentParser,
     TrainerCallback,
+    AutoModelForCausalLM,
 )
+from transformers.modeling_outputs import SequenceClassifierOutput
 
 from optimum.habana import GaudiConfig, GaudiTrainingArguments
 from optimum.habana.trl import GaudiRewardTrainer, RewardDataCollatorWithPadding
@@ -46,13 +48,13 @@ class ScriptArguments:
     learning_rate: Optional[float] = field(default=2e-5)
     weight_decay: Optional[float] = field(default=0.001)
     model_name_or_path: Optional[str] = field(
-        default="meta-llama/Llama-2-7b-hf",
+    default="google/gemma-3-270m",
         metadata={
             "help": "The model that you want to train from the Hugging Face hub. E.g. gpt2, gpt2-xl, bert, etc."
         },
     )
     tokenizer_name_or_path: Optional[str] = field(
-        default="meta-llama/Llama-2-7b-hf",
+    default="google/gemma-3-270m",
         metadata={
             "help": "The tokenizer for your model, if left empty will use the default for your model",
         },
@@ -116,7 +118,7 @@ class ScriptArguments:
         },
     )
     merge_adapter_after_train: bool = field(
-        default=False, metadata={"help": "If True, merge reward model LoRA adapter into base after training."}
+        default=True, metadata={"help": "If True, merge reward model LoRA adapter into base after training."}
     )
     merged_output_dir: Optional[str] = field(
         default=None, metadata={"help": "Directory to save merged reward model (defaults to <output_dir>_merged)."}
@@ -180,6 +182,23 @@ tokenizer_name = (
     else script_args.model_name_or_path
 )
 tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, token=script_args.token)
+
+# Provide sensible default LoRA target modules for Gemma/LLaMA style architectures if none specified.
+if script_args.lora_target_modules is None or (isinstance(script_args.lora_target_modules, list) and len(script_args.lora_target_modules) == 0):
+    inferred_default_targets = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "up_proj",
+        "down_proj",
+        "gate_proj",
+    ]
+    script_args.lora_target_modules = inferred_default_targets
+    logging.getLogger(__name__).info(
+        f"[LoRA][AutoDefault] No lora_target_modules provided -> using {script_args.lora_target_modules}"
+    )
+
 peft_config = LoraConfig(
     task_type=TaskType.SEQ_CLS,
     inference_mode=False,
@@ -190,10 +209,63 @@ peft_config = LoraConfig(
     bias="none",
 )
 torch.autograd.set_detect_anomaly(True)
-model = AutoModelForSequenceClassification.from_pretrained(
-    script_args.model_name_or_path, num_labels=1, torch_dtype=torch.bfloat16
-)
-logger.info("[Model] Base sequence classification model loaded")
+used_seq_cls = True
+try:
+    model = AutoModelForSequenceClassification.from_pretrained(
+        script_args.model_name_or_path, num_labels=1, torch_dtype=torch.bfloat16
+    )
+    logger.info("[Model] Sequence classification model loaded")
+except ValueError as e:
+    logger.warning(f"[Fallback] Could not load as SequenceClassification: {e}\n[Fallback] Building causal LM reward wrapper")
+    used_seq_cls = False
+    base_lm = AutoModelForCausalLM.from_pretrained(
+        script_args.model_name_or_path, torch_dtype=torch.bfloat16, output_hidden_states=True
+    )
+    hidden_size = getattr(base_lm.config, 'hidden_size', getattr(base_lm.config, 'model_dim', None))
+    if hidden_size is None:
+        raise RuntimeError("Could not infer hidden size from Gemma config for reward head")
+
+    class CausalLMRewardModel(torch.nn.Module):
+        def __init__(self, lm, hidden_size):
+            super().__init__()
+            self.lm = lm
+            self.value_head = torch.nn.Linear(hidden_size, 1)
+            # ensure pad token id is defined later
+
+        def forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            labels=None,  # ignored (compatibility)
+            **kwargs,
+        ):
+            # Avoid passing output_hidden_states twice if Trainer already supplied it.
+            filtered_kwargs = {k: v for k, v in kwargs.items() if k not in {"labels"}}
+            # Ensure we do get hidden states for value head pooling.
+            if "output_hidden_states" not in filtered_kwargs:
+                filtered_kwargs["output_hidden_states"] = True
+            outputs = self.lm(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                **filtered_kwargs,
+            )
+            # last hidden state (batch, seq, hidden)
+            hidden = outputs.hidden_states[-1]
+            if attention_mask is not None:
+                lengths = attention_mask.sum(dim=1) - 1
+                last_tokens = hidden[torch.arange(hidden.size(0), device=hidden.device), lengths.clamp(min=0)]
+            else:
+                last_tokens = hidden[:, -1]
+            reward = self.value_head(last_tokens)  # (batch,1)
+            return SequenceClassifierOutput(logits=reward)
+
+        @property
+        def config(self):
+            return self.lm.config
+
+    model = CausalLMRewardModel(base_lm, hidden_size)
+    logger.info("[Fallback] Causal LM reward wrapper constructed (linear head over last token)")
 
 def _param_stats(m):
     tot=trn=0
@@ -202,9 +274,12 @@ def _param_stats(m):
     return tot,trn,(trn/tot*100 if tot else 0)
 
 model = get_peft_model(model, peft_config)
-model.print_trainable_parameters()
+try:
+    model.print_trainable_parameters()
+except Exception:
+    pass
 tot,trn,pct=_param_stats(model)
-logger.info(f"[Model Params][After LoRA] total={tot:,} trainable={trn:,} ({pct:.4f}%)")
+logger.info(f"[Model Params][After LoRA] total={tot:,} trainable={trn:,} ({pct:.4f}%) (seq_cls={used_seq_cls})")
 # Need to do this for gpt2, because it doesn't have an official pad token.
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
@@ -313,26 +388,86 @@ logger.info(f"[INFO] Model saved to {script_args.output_dir}")
 
 # Optional inline merge
 if script_args.merge_adapter_after_train:
-    try:
-        from peft import PeftConfig, PeftModel
-        import os
-        adapter_dir = script_args.output_dir
-        peft_conf = PeftConfig.from_pretrained(adapter_dir)
-        logger.info(f"[MergeInline] Loaded PEFT config task_type={peft_conf.task_type}")
-        # Reward model is sequence classification
-        base_model_fresh = AutoModelForSequenceClassification.from_pretrained(
-            script_args.model_name_or_path, num_labels=1, torch_dtype=torch.bfloat16
-        )
-        merged = PeftModel.from_pretrained(base_model_fresh, adapter_dir)
-        logger.info("[MergeInline] Adapter loaded into fresh base reward model; merging...")
-        merged = merged.merge_and_unload()
-        out_dir = script_args.merged_output_dir or f"{script_args.output_dir}_merged"
-        if os.path.exists(out_dir) and not script_args.merge_overwrite:
-            logger.warning(f"[MergeInline] Output dir {out_dir} exists and merge_overwrite=False -> abort merge")
-        else:
-            os.makedirs(out_dir, exist_ok=True)
-            merged.save_pretrained(out_dir)
-            tokenizer.save_pretrained(out_dir)
-            logger.info(f"[MergeInline] Merged reward model saved to {out_dir}")
-    except Exception as e:
-        logger.exception(f"[MergeInline] Failed to merge reward adapter inline: {e}")
+    from peft import PeftConfig, PeftModel
+    import os, json
+    adapter_dir = script_args.output_dir
+    out_dir = script_args.merged_output_dir or f"{script_args.output_dir}_merged"
+    if os.path.exists(out_dir) and not script_args.merge_overwrite:
+        logger.warning(f"[MergeInline] Output dir {out_dir} exists and merge_overwrite=False -> abort merge")
+    else:
+        try:
+            if used_seq_cls:
+                peft_conf = PeftConfig.from_pretrained(adapter_dir)
+                logger.info(f"[MergeInline] (SeqCls) Loaded PEFT config task_type={peft_conf.task_type}")
+                base_model_source = getattr(peft_conf, 'base_model_name_or_path', None) or script_args.model_name_or_path
+                if (not base_model_source or base_model_source in {"None", "none", ""}):
+                    base_model_source = script_args.model_name_or_path
+                    logger.warning("[MergeInline][SeqCls][Fallback] base_model_name_or_path missing in adapter; using CLI model path.")
+                base_model_fresh = AutoModelForSequenceClassification.from_pretrained(
+                    base_model_source, num_labels=1, torch_dtype=torch.bfloat16
+                )
+                merged = PeftModel.from_pretrained(base_model_fresh, adapter_dir)
+                logger.info("[MergeInline] (SeqCls) Merging LoRA adapter into base model...")
+                merged = merged.merge_and_unload()
+                os.makedirs(out_dir, exist_ok=True)
+                merged.save_pretrained(out_dir)
+                tokenizer.save_pretrained(out_dir)
+                logger.info(f"[MergeInline] (SeqCls) Merged reward model saved to {out_dir}")
+            else:
+                # Fallback path: merge adapter into causal LM wrapper then export wrapper metadata + base model
+                logger.info("[MergeInline][Fallback] Attempting merge for causal LM reward wrapper.")
+                peft_conf = PeftConfig.from_pretrained(adapter_dir)
+                base_model_name = getattr(peft_conf, 'base_model_name_or_path', None)
+                if not base_model_name or base_model_name in {"None", "none", ""}:
+                    base_model_name = script_args.model_name_or_path
+                    logger.warning(f"[MergeInline][Fallback] base_model_name_or_path missing; using CLI model path {base_model_name}")
+                base_lm_fresh = AutoModelForCausalLM.from_pretrained(
+                    base_model_name, torch_dtype=torch.bfloat16, output_hidden_states=True
+                )
+                hidden_size = getattr(base_lm_fresh.config, 'hidden_size', getattr(base_lm_fresh.config, 'model_dim', None))
+                if hidden_size is None:
+                    raise RuntimeError("[MergeInline][Fallback] Could not infer hidden size from base LM config.")
+
+                class CausalLMRewardModel(torch.nn.Module):
+                    def __init__(self, lm, hidden):
+                        super().__init__()
+                        self.lm = lm
+                        self.value_head = torch.nn.Linear(hidden, 1)
+                    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                        if "output_hidden_states" not in kwargs:
+                            kwargs["output_hidden_states"] = True
+                        outputs = self.lm(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, **kwargs)
+                        hidden = outputs.hidden_states[-1]
+                        if attention_mask is not None:
+                            lengths = attention_mask.sum(dim=1) - 1
+                            last_tokens = hidden[torch.arange(hidden.size(0), device=hidden.device), lengths.clamp(min=0)]
+                        else:
+                            last_tokens = hidden[:, -1]
+                        reward = self.value_head(last_tokens)
+                        return SequenceClassifierOutput(logits=reward)
+                    @property
+                    def config(self):
+                        return self.lm.config
+
+                wrapper_fresh = CausalLMRewardModel(base_lm_fresh, hidden_size)
+                peft_loaded = PeftModel.from_pretrained(wrapper_fresh, adapter_dir)
+                logger.info("[MergeInline][Fallback] Merging adapter into causal LM base...")
+                try:
+                    merged_wrapper = peft_loaded.merge_and_unload()
+                except Exception as e:
+                    logger.warning(f"[MergeInline][Fallback] merge_and_unload failed ({e}); using adapter model directly (still exporting).")
+                    merged_wrapper = peft_loaded
+
+                os.makedirs(out_dir, exist_ok=True)
+                # Save underlying base LM (merged) using its save_pretrained
+                merged_wrapper.lm.save_pretrained(out_dir)
+                tokenizer.save_pretrained(out_dir)
+                # Persist value head separately + metadata so loader can reconstruct wrapper
+                vh_path = os.path.join(out_dir, "reward_value_head.bin")
+                torch.save(merged_wrapper.value_head.state_dict(), vh_path)
+                meta = {"reward_head_type": "linear_last_token", "hidden_size": hidden_size}
+                with open(os.path.join(out_dir, "reward_head_config.json"), "w") as f:
+                    json.dump(meta, f)
+                logger.info(f"[MergeInline][Fallback] Exported merged causal LM reward model to {out_dir} (value head + metadata)")
+        except Exception as e:
+            logger.exception(f"[MergeInline] Failed to merge reward adapter inline: {e}")

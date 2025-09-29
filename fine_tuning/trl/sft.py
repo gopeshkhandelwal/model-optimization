@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ScriptArguments:
-    model_name_or_path: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "the model name"})
+    model_name_or_path: Optional[str] = field(default="google/gemma-3-270m", metadata={"help": "the (Gemma 3) model name"})
     dataset_name: Optional[str] = field(default=None, metadata={"help": "the dataset name"})
     use_peft: Optional[bool] = field(default=True, metadata={"help": "whether to use peft"})
     subset: Optional[str] = field(default="data/finetune", metadata={"help": "the subset to use"})

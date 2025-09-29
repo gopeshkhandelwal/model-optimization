@@ -18,16 +18,18 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
 )
+from transformers.modeling_outputs import SequenceClassifierOutput
 
 from logging_utils import setup_logging
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--base_model", default="meta-llama/Llama-2-7b-hf")
+    p.add_argument("--base_model", default="google/gemma-3-270m")
     p.add_argument("--finetuned_model", "--ppo_model", dest="ppo_model", default="./ppo_sanity")
     p.add_argument("--reward_model", default="./rm_sanity_merged")
     p.add_argument("--max_new_tokens", type=int, default=64)
+    p.add_argument("--reward_max_length", type=int, default=2048, help="Max tokens for reward model scoring (clamped to avoid gigantic model_max_length sentinels).")
     p.add_argument("--seed", type=int, default=None, help="Seed for reproducibility. If unset -> non-deterministic sampling")
     p.add_argument("--do_sample", type=lambda v: str(v).lower() in {"1","true","yes"}, default=True)
     p.add_argument("--top_p", type=float, default=1.0)
@@ -96,22 +98,162 @@ if getattr(tokenizer, "pad_token", None) is None:
 tokenizer.padding_side = "left"  # safer for causal LM generation when padding
 logger.info("[Tokenizer] Loaded tokenizer & set pad_token -> eos_token")
 
-# Reward model
-rm = AutoModelForSequenceClassification.from_pretrained(
-    reward_model_path, num_labels=1, torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32
-)
+def load_reward_model(path: str):
+    """Attempt to load a reward model.
+    Order:
+      1. If directory contains reward_head_config.json + reward_value_head.bin -> reconstruct causal LM wrapper.
+      2. Try AutoModelForSequenceClassification.
+      3. Fallback: causal LM + linear head on last token hidden state.
+    Returns model (nn.Module) and a flag indicating if it's a native SeqCls model.
+    """
+    if os.path.isdir(path):
+        head_meta = os.path.join(path, "reward_head_config.json")
+        head_weights = os.path.join(path, "reward_value_head.bin")
+        if os.path.isfile(head_meta) and os.path.isfile(head_weights):
+            logger.info("[RewardModel][MergedFallback] Detected merged causal LM reward export.")
+            import json as _json
+            meta = _json.load(open(head_meta))
+            hidden_size = meta.get("hidden_size")
+            if hidden_size is None:
+                raise RuntimeError("[RewardModel][MergedFallback] hidden_size missing in reward_head_config.json")
+            base_lm = AutoModelForCausalLM.from_pretrained(
+                path,
+                torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
+                low_cpu_mem_usage=True,
+                output_hidden_states=True,
+            )
+            class _CausalLMRewardWrapper(torch.nn.Module):
+                def __init__(self, lm, hidden):
+                    super().__init__()
+                    self.lm = lm
+                    self.value_head = torch.nn.Linear(hidden, 1)
+                def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                    if "output_hidden_states" not in kwargs:
+                        kwargs["output_hidden_states"] = True
+                    outputs = self.lm(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, **kwargs)
+                    hidden = outputs.hidden_states[-1]
+                    if attention_mask is not None:
+                        lengths = attention_mask.sum(dim=1) - 1
+                        last_tokens = hidden[torch.arange(hidden.size(0), device=hidden.device), lengths.clamp(min=0)]
+                    else:
+                        last_tokens = hidden[:, -1]
+                    reward = self.value_head(last_tokens)
+                    return SequenceClassifierOutput(logits=reward)
+                @property
+                def config(self):
+                    return self.lm.config
+                def can_generate(self):
+                    return False
+            wrapper = _CausalLMRewardWrapper(base_lm, hidden_size)
+            state = torch.load(head_weights, map_location="cpu")
+            wrapper.value_head.load_state_dict(state)
+            return wrapper, False
+    # Try native sequence classification
+    try:
+        seq = AutoModelForSequenceClassification.from_pretrained(
+            path,
+            num_labels=1,
+            torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
+            low_cpu_mem_usage=True,
+        )
+        return seq, True
+    except Exception as e:
+        logger.warning(f"[RewardModel] SequenceClassification load failed ({e}). Falling back to causal LM wrapper.")
+    # Fallback causal LM wrapper
+    base_lm = AutoModelForCausalLM.from_pretrained(
+        path,
+        torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
+        low_cpu_mem_usage=True,
+        output_hidden_states=True,
+    )
+    hidden_size = getattr(base_lm.config, "hidden_size", getattr(base_lm.config, "model_dim", None))
+    if hidden_size is None:
+        raise RuntimeError("[RewardModel][Fallback] Could not infer hidden size from LM config.")
+    class _CausalLMRewardWrapper(torch.nn.Module):
+        def __init__(self, lm, hidden):
+            super().__init__()
+            self.lm = lm
+            self.value_head = torch.nn.Linear(hidden, 1)
+        def forward(self, input_ids=None, attention_mask=None, **kwargs):
+            if "output_hidden_states" not in kwargs:
+                kwargs["output_hidden_states"] = True
+            outputs = self.lm(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, **kwargs)
+            hidden = outputs.hidden_states[-1]
+            if attention_mask is not None:
+                lengths = attention_mask.sum(dim=1) - 1
+                last_tokens = hidden[torch.arange(hidden.size(0), device=hidden.device), lengths.clamp(min=0)]
+            else:
+                last_tokens = hidden[:, -1]
+            reward = self.value_head(last_tokens)
+            return SequenceClassifierOutput(logits=reward)
+        @property
+        def config(self):
+            return self.lm.config
+        def can_generate(self):
+            return False
+    return _CausalLMRewardWrapper(base_lm, hidden_size), False
+
+rm, is_seq = load_reward_model(reward_model_path)
 rm.to(device)
 rm.eval()
-rm_pipe = pipeline(
-    "sentiment-analysis",
-    model=rm,
-    tokenizer=tokenizer,
-    device=0 if device != "cpu" else -1,
-    function_to_apply="none",  # raw score
-    return_all_scores=False,
-    truncation=True,
-)
-logger.info("[RewardModel] Loaded & pipeline constructed")
+# Provide minimal labels for pipeline compatibility if needed
+if not getattr(rm.config, "id2label", None):
+    rm.config.id2label = {0: "LABEL_0"}
+    rm.config.label2id = {"LABEL_0": 0}
+
+reward_use_pipeline = True
+rm_pipe = None
+if is_seq:
+    try:
+        rm_pipe = pipeline(
+            "sentiment-analysis",
+            model=rm,
+            tokenizer=tokenizer,
+            device=0 if device != "cpu" else -1,
+            function_to_apply="none",  # raw logit
+            truncation=True,
+            top_k=None,
+        )
+        logger.info("[RewardModel] Loaded SequenceClassification model & pipeline constructed")
+    except Exception as e:
+        logger.warning(f"[RewardModel] Pipeline failed for seq model: {e}; using manual scoring")
+        reward_use_pipeline = False
+else:
+    reward_use_pipeline = False
+
+def score_reward(text: str) -> float:
+    if reward_use_pipeline and rm_pipe is not None:
+        try:
+            return float(rm_pipe(text)[0]["score"])  # type: ignore[index]
+        except Exception as e:
+            logger.warning(f"[RewardModel] Pipeline scoring failed ({e}); switching to manual.")
+    # Manual scoring path
+    # Some tokenizers set model_max_length to a huge sentinel (e.g., 1000000000000001) -> clamp
+    model_max = getattr(tokenizer, "model_max_length", None)
+    if model_max is None or model_max <= 0:
+        model_max = args.reward_max_length
+    # Treat extremely large values as 'infinite'
+    if model_max > 10000:  # arbitrary threshold; adjust as needed
+        model_max = args.reward_max_length
+    max_len = min(model_max, args.reward_max_length)
+    enc = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        padding=False,
+        max_length=max_len,
+    ).to(device)
+    with torch.no_grad():
+        out = rm(**enc)
+        logits = getattr(out, "logits", None)
+        if logits is None:
+            if isinstance(out, (tuple, list)) and len(out) > 0:
+                logits = out[0]
+            else:
+                raise RuntimeError("[RewardModel] Could not obtain logits in manual scoring.")
+        if logits.dim() == 2 and logits.size(1) == 1:
+            return float(logits[0, 0].item())
+        return float(logits.view(-1)[-1].item())
 
 # Load both causal models once
 def load_causal(path: str):
@@ -166,7 +308,7 @@ for idx, prompt in enumerate(prompts, start=1):
         gen_dur = time.time() - gen_start
         reward_start = time.time()
         formatted_for_reward = f"Question: {prompt}\n\nAnswer: {resp}"  # match reward model training format
-        score = rm_pipe(formatted_for_reward)[0]["score"]
+        score = score_reward(formatted_for_reward)
         reward_dur = time.time() - reward_start
         model_total = time.time() - model_total_start
         logger.info(

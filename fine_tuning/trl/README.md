@@ -37,11 +37,11 @@ To achieve robust and production-quality fine-tuning of Llama models, the pipeli
 All steps will run sequentially, with output and logs saved to `ppo_pipeline_sanity.log` for review.
 
 1. **Supervised Fine-Tuning (SFT)**
-    - Trains the base Llama model on curated human demonstration data, teaching it to follow instructions and generate useful responses. LoRA adapters and Habana optimizations accelerate and scale this process.
+  - Trains the base Gemma (small 270M for quick iteration) model on curated human demonstration data, teaching it to follow instructions and generate useful responses. LoRA adapters and Habana optimizations accelerate and scale this process.
    - Example command:
      ```bash
      python sft.py \
-       --model_name_or_path meta-llama/Llama-2-7b-hf \
+       --model_name_or_path google/gemma-3-270m \
        --dataset_name lvwerra/stack-exchange-paired \
        --output_dir ./sft_sanity \
        --do_train \
@@ -60,7 +60,7 @@ All steps will run sequentially, with output and logs saved to `ppo_pipeline_san
    - Example command:
      ```bash
      python merge_peft_adapter.py \
-       --base_model_name "meta-llama/Llama-2-7b-hf" \
+       --base_model_name "google/gemma-3-270m" \
        --adapter_model_name "./sft_sanity" \
        --output_name "./sft_sanity_merged"
      ```
@@ -71,7 +71,7 @@ All steps will run sequentially, with output and logs saved to `ppo_pipeline_san
      ```bash
      python reward_modeling.py \
        --model_name_or_path ./sft_sanity_merged \
-       --tokenizer_name_or_path meta-llama/Llama-2-7b-hf \
+       --tokenizer_name_or_path google/gemma-3-270m \
        --output_dir ./rm_sanity \
        --optim adamw_torch \
        --per_device_train_batch_size 2 \
@@ -88,7 +88,7 @@ All steps will run sequentially, with output and logs saved to `ppo_pipeline_san
    - Example command:
      ```bash
      python merge_peft_adapter.py \
-       --base_model_name "meta-llama/Llama-2-7b-hf" \
+       --base_model_name "google/gemma-3-270m" \
        --adapter_model_name "./rm_sanity" \
        --output_name "./rm_sanity_merged"
      ```
@@ -100,7 +100,7 @@ All steps will run sequentially, with output and logs saved to `ppo_pipeline_san
      PT_HPU_LAZY_MODE=1 python ppo.py \
        --model_name_or_path ./sft_sanity_merged \
        --reward_model_name ./rm_sanity_merged \
-       --tokenizer_name_or_path meta-llama/Llama-2-7b-hf \
+       --tokenizer_name_or_path google/gemma-3-270m \
        --output_dir ./ppo_sanity \
        --batch_size 2 \
        --mini_batch_size 1 \
@@ -140,7 +140,7 @@ After completing the pipeline, you can quantitatively compare the base model and
 
 ```bash
 PT_HPU_LAZY_MODE=1 python compare_base_vs_ppo.py \
-  --base_model meta-llama/Llama-2-7b-hf \
+  --base_model google/gemma-3-270m \
   --finetuned_model ./ppo_sanity \
   --reward_model ./rm_sanity_merged \
   --dataset_name lvwerra/stack-exchange-paired \

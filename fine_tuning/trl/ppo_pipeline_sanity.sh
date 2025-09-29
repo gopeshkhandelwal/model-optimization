@@ -2,6 +2,12 @@
 set -euo pipefail
 
 START_PIPELINE=$(date +%s)
+
+# Config toggles (override via environment if desired)
+PPO_MERGE_POLICY=${PPO_MERGE_POLICY:-1}           # 1 = merge PPO adapter after training
+POLICY_MERGED_DIR=${POLICY_MERGED_DIR:-./ppo_sanity_merged}
+REWARD_MERGED_DIR=./rm_sanity_merged
+REWARD_ADAPTER_DIR=./rm_sanity
 declare -A STEP_START
 declare -A STEP_DURATION
 
@@ -34,7 +40,7 @@ export PT_HPU_ENABLE_REFINE_DYNAMIC_SHAPES=0
 banner "STEP 1: Supervised Fine-Tuning (SFT + Merge Inline)"
 time_step_begin SFT
 python sft.py \
-  --model_name_or_path meta-llama/Llama-2-7b-hf \
+  --model_name_or_path ${GEMMA3_DEFAULT_MODEL:-google/gemma-3-270m} \
   --dataset_name lvwerra/stack-exchange-paired \
   --output_dir ./sft_sanity \
   --do_train \
@@ -61,7 +67,7 @@ banner "STEP 2: Reward Modeling (Inline Merge)"
 time_step_begin RM
 python reward_modeling.py \
   --model_name_or_path ./sft_sanity_merged \
-  --tokenizer_name_or_path meta-llama/Llama-2-7b-hf \
+  --tokenizer_name_or_path ${GEMMA3_DEFAULT_MODEL:-google/gemma-3-270m} \
   --output_dir ./rm_sanity \
   --optim adamw_torch \
   --per_device_train_batch_size 2 \
@@ -75,14 +81,26 @@ python reward_modeling.py \
   --bf16 \
   --merge_adapter_after_train \
   --merged_output_dir ./rm_sanity_merged
+# NOTE: For Gemma 3 tiny model the reward script may fall back to a causal LM wrapper and skip merge.
+# In that case only ./rm_sanity (adapter + value head) will exist (no rm_sanity_merged). The PPO loader
+# can now consume an adapter-only dir directly, so rm_sanity_merged is optional.
 time_step_end RM
+
+# Decide which reward model directory to use (prefer merged if present)
+if [ -d "${REWARD_MERGED_DIR}" ]; then
+  REWARD_FOR_PPO="${REWARD_MERGED_DIR}"
+  echo "[SELECT] Using merged reward model: ${REWARD_FOR_PPO}"
+else
+  REWARD_FOR_PPO="${REWARD_ADAPTER_DIR}"
+  echo "[SELECT] Merged reward model not found; using adapter directory: ${REWARD_FOR_PPO}"
+fi
 
 banner "STEP 3: PPO Training"
 time_step_begin PPO
 PT_HPU_LAZY_MODE=1 python ppo.py \
   --model_name_or_path ./sft_sanity_merged \
-  --reward_model_name ./rm_sanity_merged \
-  --tokenizer_name_or_path meta-llama/Llama-2-7b-hf \
+  --reward_model_name "${REWARD_FOR_PPO}" \
+  --tokenizer_name_or_path ${GEMMA3_DEFAULT_MODEL:-google/gemma-3-270m} \
   --output_dir ./ppo_sanity \
   --batch_size 2 \
   --mini_batch_size 1 \
@@ -94,15 +112,16 @@ PT_HPU_LAZY_MODE=1 python ppo.py \
   --learning_rate 1.4e-5 \
   --early_stopping True \
   --batched_gen True \
-  --max_train_samples 256
+  --max_train_samples 256 \
+  $( [ "${PPO_MERGE_POLICY}" = "1" ] && echo "--merge_adapter_after_train --merged_output_dir ${POLICY_MERGED_DIR}" )
 time_step_end PPO
 
 banner "STEP 4: Comparing Base and PPO Models"
 time_step_begin COMPARE
 PT_HPU_LAZY_MODE=1 python compare_base_vs_ppo.py \
-  --base_model meta-llama/Llama-2-7b-hf \
+  --base_model ${GEMMA3_DEFAULT_MODEL:-google/gemma-3-270m} \
   --finetuned_model ./ppo_sanity \
-  --reward_model ./rm_sanity_merged \
+  --reward_model "${REWARD_FOR_PPO}" \
   --seed 123 \
   --greedy
 time_step_end COMPARE
@@ -119,5 +138,16 @@ for k in SFT RM PPO COMPARE; do
 done
 printf "%-20s %10s\n" "TOTAL" "$TOTAL_DUR"
 echo "==============================================================="
+
+echo
+echo "=================== ARTIFACT SUMMARY ==================="
+if [ -d ./sft_sanity_merged ]; then echo "SFT merged policy: ./sft_sanity_merged"; fi
+if [ -d ./rm_sanity ]; then echo "Reward adapter: ./rm_sanity"; fi
+if [ -d ./rm_sanity_merged ]; then echo "Reward merged: ./rm_sanity_merged"; fi
+if [ -d ./ppo_sanity ]; then echo "PPO adapter policy: ./ppo_sanity"; fi
+if [ -d "${POLICY_MERGED_DIR}" ]; then echo "PPO merged policy: ${POLICY_MERGED_DIR}"; fi
+echo "Reward used for PPO: ${REWARD_FOR_PPO}"
+echo "Policy merge enabled: ${PPO_MERGE_POLICY}"
+echo "========================================================"
 
 banner "✅ PIPELINE COMPLETED SUCCESSFULLY (WITH COMPARISON)"
