@@ -3,7 +3,7 @@
 
 .PHONY: build run
 
-DOCKER_IMAGE=trl-llama-3-8b-habana
+DOCKER_IMAGE=trl-gemma3-habana
 ENV_FLAGS=\
 	-e HF_TOKEN=$(HF_TOKEN)
 
