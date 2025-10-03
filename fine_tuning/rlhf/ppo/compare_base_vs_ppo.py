@@ -24,9 +24,9 @@ from logging_utils import setup_logging
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--base_model", default="meta-llama/Llama-2-7b-hf")
-    p.add_argument("--finetuned_model", "--ppo_model", dest="ppo_model", default="./ppo_sanity")
-    p.add_argument("--reward_model", default="./rm_sanity_merged")
+    p.add_argument("--base_model", required=True, help="Base model path (REQUIRED)")
+    p.add_argument("--finetuned_model", "--ppo_model", dest="ppo_model", required=True, help="Fine-tuned/PPO model path (REQUIRED)")
+    p.add_argument("--reward_model", required=True, help="Reward model path (REQUIRED)")
     p.add_argument("--max_new_tokens", type=int, default=64)
     p.add_argument("--seed", type=int, default=None, help="Seed for reproducibility. If unset -> non-deterministic sampling")
     p.add_argument("--do_sample", type=lambda v: str(v).lower() in {"1","true","yes"}, default=True)
@@ -71,6 +71,14 @@ base_model = args.base_model
 ppo_model = args.ppo_model
 reward_model_path = args.reward_model
 
+# Validate required arguments
+if not base_model or base_model.strip() == "":
+    raise ValueError("--base_model is required and cannot be empty. Please specify the base model path.")
+if not ppo_model or ppo_model.strip() == "":
+    raise ValueError("--finetuned_model is required and cannot be empty. Please specify the fine-tuned model path.")
+if not reward_model_path or reward_model_path.strip() == "":
+    raise ValueError("--reward_model is required and cannot be empty. Please specify the reward model path.")
+
 logger.info(
     f"[Init] base_model={base_model} ppo_model={ppo_model} reward_model_path={reward_model_path} seed={args.seed}"
 )
@@ -96,22 +104,108 @@ if getattr(tokenizer, "pad_token", None) is None:
 tokenizer.padding_side = "left"  # safer for causal LM generation when padding
 logger.info("[Tokenizer] Loaded tokenizer & set pad_token -> eos_token")
 
-# Reward model
-rm = AutoModelForSequenceClassification.from_pretrained(
-    reward_model_path, num_labels=1, torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32
-)
-rm.to(device)
-rm.eval()
-rm_pipe = pipeline(
-    "sentiment-analysis",
-    model=rm,
-    tokenizer=tokenizer,
-    device=0 if device != "cpu" else -1,
-    function_to_apply="none",  # raw score
-    return_all_scores=False,
-    truncation=True,
-)
-logger.info("[RewardModel] Loaded & pipeline constructed")
+# Reward model - with fallback for Gemma3 causal LM reward models
+reward_model_is_causal_lm = False
+try:
+    rm = AutoModelForSequenceClassification.from_pretrained(
+        reward_model_path, num_labels=1, torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32
+    )
+    rm.to(device)
+    rm.eval()
+    logger.info(f"[RewardModel] Loaded sequence classification reward model: {reward_model_path}")
+except ValueError as e:
+    if "Unrecognized configuration class" in str(e) and "AutoModelForSequenceClassification" in str(e):
+        logger.warning(f"[RewardModel][Fallback] Could not load as SequenceClassification: {e}")
+        logger.info("[RewardModel][Fallback] Attempting to load as causal LM reward wrapper")
+        
+        # Try to load as a merged causal LM with reward head (from reward_modeling.py output)
+        import os
+        import json
+        
+        # Check if this is a merged causal LM reward model
+        reward_config_path = os.path.join(reward_model_path, "reward_head_config.json")
+        if os.path.exists(reward_config_path):
+            logger.info("[RewardModel][Fallback] Found reward head config, loading merged causal LM reward model")
+            with open(reward_config_path, "r") as f:
+                reward_config = json.load(f)
+            
+            rm = AutoModelForCausalLM.from_pretrained(
+                reward_model_path,
+                torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
+                low_cpu_mem_usage=True,
+                attn_implementation="eager",
+                output_hidden_states=True
+            )
+            
+            # Add the reward head
+            import torch.nn as nn
+            hidden_size = reward_config["hidden_size"]
+            rm.score = nn.Linear(hidden_size, 1, bias=False)
+            
+            # Load the reward head weights
+            reward_head_path = os.path.join(reward_model_path, "reward_value_head.bin")
+            if os.path.exists(reward_head_path):
+                reward_head_state = torch.load(reward_head_path, map_location="cpu")
+                rm.score.load_state_dict(reward_head_state)
+                logger.info("[RewardModel][Fallback] Loaded reward head weights")
+            else:
+                logger.warning("[RewardModel][Fallback] No reward head weights found, using random initialization")
+            
+            rm.to(device)
+            rm.eval()
+            reward_model_is_causal_lm = True
+            logger.info(f"[RewardModel][Fallback] Loaded merged causal LM reward model: {reward_model_path}")
+        else:
+            logger.error(f"[RewardModel][Fallback] No reward head config found at {reward_config_path}")
+            raise ValueError(f"Cannot load reward model {reward_model_path} - neither sequence classification nor merged causal LM format")
+    else:
+        raise
+
+# Create reward scoring function
+if reward_model_is_causal_lm:
+    logger.info("[RewardModel] Using custom reward function for causal LM")
+    def get_reward_score(text):
+        """Custom reward function for causal LM reward models"""
+        rm.eval()
+        with torch.no_grad():
+            # Tokenize the text
+            inputs = tokenizer(
+                text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,  # Reasonable limit for reward scoring
+                padding=False
+            ).to(device)
+            
+            # Get model outputs
+            outputs = rm(**inputs, output_hidden_states=True)
+            
+            # Get the last hidden state and compute reward
+            hidden_states = outputs.hidden_states[-1]  # Last layer
+            # Use the last non-padding token's hidden state
+            sequence_lengths = inputs.attention_mask.sum(dim=1) - 1
+            last_token_hidden = hidden_states[0, sequence_lengths[0]]
+            
+            # Compute reward score
+            reward_score = rm.score(last_token_hidden.unsqueeze(0))
+            return reward_score.item()
+else:
+    logger.info("[RewardModel] Using pipeline for sequence classification")
+    rm_pipe = pipeline(
+        "sentiment-analysis",
+        model=rm,
+        tokenizer=tokenizer,
+        device=0 if device != "cpu" else -1,
+        function_to_apply="none",  # raw score
+        return_all_scores=False,
+        truncation=True,
+    )
+    
+    def get_reward_score(text):
+        """Wrapper for pipeline-based reward computation"""
+        return rm_pipe(text)[0]["score"]
+
+logger.info("[RewardModel] Loaded & reward function constructed")
 
 # Load both causal models once
 def load_causal(path: str):
@@ -166,7 +260,7 @@ for idx, prompt in enumerate(prompts, start=1):
         gen_dur = time.time() - gen_start
         reward_start = time.time()
         formatted_for_reward = f"Question: {prompt}\n\nAnswer: {resp}"  # match reward model training format
-        score = rm_pipe(formatted_for_reward)[0]["score"]
+        score = get_reward_score(formatted_for_reward)
         reward_dur = time.time() - reward_start
         model_total = time.time() - model_total_start
         logger.info(

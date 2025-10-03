@@ -30,9 +30,9 @@ class ScriptArguments:
 
     # NOTE: gpt2 models use Conv1D instead of Linear layers which are not yet supported in 8 bit mode
     # models like gpt-neo* models are more suitable.
-    model_name_or_path: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "the model name"})
+    model_name_or_path: Optional[str] = field(default=None, metadata={"help": "the model name (REQUIRED)"})
     tokenizer_name_or_path: Optional[str] = field(
-        default="meta-llama/Llama-2-7b-hf", metadata={"help": "the tokenizer name"}
+        default=None, metadata={"help": "the tokenizer name (defaults to model_name_or_path if not provided)"}
     )
     reward_model_name: Optional[str] = field(default="", metadata={"help": "the reward model name"})
     log_with: Optional[str] = field(default=None, metadata={"help": "use 'wandb' to log with wandb"})
@@ -88,6 +88,14 @@ from logging_utils import setup_logging
 script_args: ScriptArguments = parser.parse_args_into_dataclasses()[0]
 setup_logging()
 logger = logging.getLogger(__name__)
+
+# Validate required arguments
+if not script_args.model_name_or_path:
+    raise ValueError("--model_name_or_path is required. Please specify the base model path.")
+if not script_args.tokenizer_name_or_path:
+    script_args.tokenizer_name_or_path = script_args.model_name_or_path
+    logger.info(f"tokenizer_name_or_path not provided, using model path: {script_args.tokenizer_name_or_path}")
+
 logger.info(f"ScriptArguments: {script_args}")
 reward_model_name = script_args.reward_model_name
 dataset_name = "lvwerra/stack-exchange-paired"
@@ -201,6 +209,11 @@ def collator(data):
 # set seed before initializing value head for deterministic eval
 set_seed(config.seed)
 
+# Auto-detect LoRA target modules if not specified
+if script_args.lora_target_modules is None:
+    logger.info("[LoRA][AutoDefault] No lora_target_modules provided -> using ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'up_proj', 'down_proj', 'gate_proj']")
+    script_args.lora_target_modules = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'up_proj', 'down_proj', 'gate_proj']
+
 # Now let's build the model, the reference model, and the tokenizer.
 current_device = GaudiAccelerator().local_process_index
 lora_config = LoraConfig(
@@ -250,6 +263,13 @@ if script_args.adafactor:
         warmup_init=False,
         lr=config.learning_rate,
     )
+# Force disable batched generation for stability (especially with Gemma3)
+if script_args.batched_gen:
+    logger.warning("[Trainer] batched_gen=True can cause issues with padding/masking -> forcing to False for stability")
+    script_args.batched_gen = False
+
+logger.info(f"[Generation] Using batched_gen={script_args.batched_gen}, batch_size={script_args.batch_size}")
+
 # We then build the PPOTrainer, passing the model, the reference model, the tokenizer
 ppo_trainer = GaudiPPOTrainer(
     config,
@@ -266,12 +286,60 @@ logger.info("[Trainer] PPO trainer initialized")
 # set the device to the same device as the PPOTrainer.
 device = ppo_trainer.accelerator.device
 
-reward_model = AutoModelForSequenceClassification.from_pretrained(
-    reward_model_name,
-    num_labels=1,
-    low_cpu_mem_usage=True,
-)
-logger.info(f"[RewardModel] Loaded reward model: {reward_model_name}")
+# Try to load reward model, with fallback for unsupported models like Gemma3
+reward_model_is_causal_lm = False
+try:
+    reward_model = AutoModelForSequenceClassification.from_pretrained(
+        reward_model_name,
+        num_labels=1,
+        low_cpu_mem_usage=True,
+    )
+    logger.info(f"[RewardModel] Loaded sequence classification reward model: {reward_model_name}")
+except ValueError as e:
+    if "Unrecognized configuration class" in str(e) and "AutoModelForSequenceClassification" in str(e):
+        logger.warning(f"[RewardModel][Fallback] Could not load as SequenceClassification: {e}")
+        logger.info("[RewardModel][Fallback] Attempting to load as causal LM reward wrapper")
+        # Try to load as a merged causal LM with reward head (from reward_modeling.py output)
+        from transformers import AutoModelForCausalLM
+        import os
+        import json
+        
+        # Check if this is a merged causal LM reward model
+        reward_config_path = os.path.join(reward_model_name, "reward_head_config.json")
+        if os.path.exists(reward_config_path):
+            logger.info("[RewardModel][Fallback] Found reward head config, loading merged causal LM reward model")
+            with open(reward_config_path, "r") as f:
+                reward_config = json.load(f)
+            
+            reward_model = AutoModelForCausalLM.from_pretrained(
+                reward_model_name,
+                low_cpu_mem_usage=True,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="eager",
+                output_hidden_states=True
+            )
+            
+            # Add the reward head
+            import torch.nn as nn
+            hidden_size = reward_config["hidden_size"]
+            reward_model.score = nn.Linear(hidden_size, 1, bias=False)
+            
+            # Load the reward head weights
+            reward_head_path = os.path.join(reward_model_name, "reward_value_head.bin")
+            if os.path.exists(reward_head_path):
+                reward_head_state = torch.load(reward_head_path, map_location="cpu")
+                reward_model.score.load_state_dict(reward_head_state)
+                logger.info("[RewardModel][Fallback] Loaded reward head weights")
+            else:
+                logger.warning("[RewardModel][Fallback] No reward head weights found, using random initialization")
+            
+            reward_model_is_causal_lm = True
+            logger.info(f"[RewardModel][Fallback] Loaded merged causal LM reward model: {reward_model_name}")
+        else:
+            logger.error(f"[RewardModel][Fallback] No reward head config found at {reward_config_path}")
+            raise ValueError(f"Cannot load reward model {reward_model_name} - neither sequence classification nor merged causal LM format")
+    else:
+        raise
 
 if config.use_habana:
     from habana_frameworks.torch.hpu import wrap_in_hpu_graph
@@ -282,20 +350,58 @@ if config.use_habana:
 if device.type == "hpu":
     device = "hpu"
 
-sentiment_pipe = pipeline(
-    "sentiment-analysis",
-    model=reward_model,
-    tokenizer=tokenizer,
-    return_token_type_ids=False,
-    device=device,
-    model_kwargs={
-        "low_cpu_mem_usage": True,
-        "torch_dtype": torch.bfloat16,
-    },
-)
-
-if sentiment_pipe.model.config.pad_token_id is None:
-    sentiment_pipe.model.config.pad_token_id = tokenizer.pad_token_id
+# Create reward function - use pipeline for sequence classification, custom function for causal LM
+if reward_model_is_causal_lm:
+    logger.info("[RewardModel] Using custom reward function for causal LM")
+    def get_rewards(texts):
+        """Custom reward function for causal LM reward models"""
+        rewards = []
+        reward_model.eval()
+        with torch.no_grad():
+            for text in texts:
+                # Tokenize the text
+                inputs = tokenizer(
+                    text,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=sent_kwargs.get("max_length", script_args.input_max_length + script_args.output_max_length),
+                    padding=sent_kwargs.get("padding", False)
+                ).to(device)
+                
+                # Get model outputs
+                outputs = reward_model(**inputs, output_hidden_states=True)
+                
+                # Get the last hidden state and compute reward
+                hidden_states = outputs.hidden_states[-1]  # Last layer
+                # Use the last non-padding token's hidden state
+                sequence_lengths = inputs.attention_mask.sum(dim=1) - 1
+                last_token_hidden = hidden_states[0, sequence_lengths[0]]
+                
+                # Compute reward score
+                reward_score = reward_model.score(last_token_hidden.unsqueeze(0))
+                rewards.append([{"score": reward_score.item()}])
+        
+        return rewards
+else:
+    logger.info("[RewardModel] Using pipeline for sequence classification")
+    sentiment_pipe = pipeline(
+        "sentiment-analysis",
+        model=reward_model,
+        tokenizer=tokenizer,
+        return_token_type_ids=False,
+        device=device,
+        model_kwargs={
+            "low_cpu_mem_usage": True,
+            "torch_dtype": torch.bfloat16,
+        },
+    )
+    
+    if sentiment_pipe.model.config.pad_token_id is None:
+        sentiment_pipe.model.config.pad_token_id = tokenizer.pad_token_id
+    
+    def get_rewards(texts):
+        """Wrapper for pipeline-based reward computation"""
+        return sentiment_pipe(texts, **sent_kwargs)
 # We then define the arguments to pass to the `generate` function. These arguments
 # are passed to the `generate` function of the PPOTrainer, which is a wrapper around
 # the `generate` function of the trained model.
@@ -321,17 +427,48 @@ for epoch, batch in tqdm(enumerate(ppo_trainer.dataloader)):
         break
     question_tensors = batch["input_ids"]
     sample = sample + len(question_tensors)
-    response_tensors = ppo_trainer.generate(
-        question_tensors,
-        return_prompt=False,
-        length_sampler=output_length_sampler,
-        **generation_kwargs,
-    )
+    # Try PPO trainer generation with error handling
+    logger.info(f"[Generation] Attempting PPO trainer generation for batch size {len(question_tensors)}")
+    try:
+        response_tensors = ppo_trainer.generate(
+            question_tensors,
+            return_prompt=False,
+            length_sampler=output_length_sampler,
+            **generation_kwargs,
+        )
+        logger.info(f"[Generation] PPO trainer generation succeeded")
+    except Exception as e:
+        logger.warning(f"[Generation] PPO trainer generation failed: {e}")
+        logger.info(f"[Generation] Falling back to individual generation")
+        
+        # Fallback: Generate responses individually
+        response_tensors = []
+        for i, query_tensor in enumerate(question_tensors):
+            logger.info(f"[Generation] Processing query {i+1}/{len(question_tensors)}")
+            
+            # Generate length for this sample
+            gen_len = output_length_sampler()
+            
+            # Generate response for single query
+            with torch.no_grad():
+                single_response = ppo_trainer.model.generate(
+                    query_tensor.unsqueeze(0),  # Add batch dimension
+                    max_new_tokens=gen_len,
+                    do_sample=True,
+                    temperature=0.7,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+                # Remove the query part to get only the response
+                response_only = single_response[0][len(query_tensor):]
+                response_tensors.append(response_only)
+        
+        logger.info(f"[Generation] Fallback generation completed for {len(response_tensors)} responses")
     batch["response"] = tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
 
-    # Compute reward score (using the sentiment analysis pipeline)
+    # Compute reward score (using the reward function)
     texts = [q + r for q, r in zip(batch["query"], batch["response"])]
-    pipe_outputs = sentiment_pipe(texts, **sent_kwargs)
+    pipe_outputs = get_rewards(texts)
     rewards = [torch.tensor(output[0]["score"] - script_args.reward_baseline) for output in pipe_outputs]
     if epoch % 10 == 0:
         logger.info(f"[Loop] Epoch {epoch} sample reward: {rewards[0].item():.4f}")

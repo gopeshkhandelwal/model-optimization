@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ScriptArguments:
-    model_name_or_path: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "the model name"})
+    model_name_or_path: Optional[str] = field(default=None, metadata={"help": "the model name (REQUIRED)"})
     dataset_name: Optional[str] = field(default=None, metadata={"help": "the dataset name"})
     use_peft: Optional[bool] = field(default=True, metadata={"help": "whether to use peft"})
     subset: Optional[str] = field(default="data/finetune", metadata={"help": "the subset to use"})
@@ -85,6 +85,11 @@ if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, GaudiSFTConfig))
     script_args, training_args = parser.parse_args_into_dataclasses()
     setup_logging()
+    
+    # Validate required arguments
+    if not script_args.model_name_or_path:
+        raise ValueError("--model_name_or_path is required. Please specify the base model path.")
+    
     logger.info(f"ScriptArguments: {script_args}")
     logger.info(f"TrainingArguments: {training_args}")
     if script_args.use_peft:

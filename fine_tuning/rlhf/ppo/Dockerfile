@@ -23,9 +23,15 @@ RUN pip install --upgrade pip && \
         torch>=1.3 \
         tyro
 RUN pip install git+https://github.com/HabanaAI/DeepSpeed.git@1.21.0
-        
 
-COPY *.* /workspace/trl/
+# Create directory structure
+RUN mkdir -p /workspace/rlhf/ppo
+
+# Copy all files from current directory (ppo) to container
+COPY . /workspace/rlhf/ppo/
+
+# Set working directory to the copied files
+WORKDIR /workspace/rlhf/ppo
 
 # Default command
 CMD ["/bin/bash"]
