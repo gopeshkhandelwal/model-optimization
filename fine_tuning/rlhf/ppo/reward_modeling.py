@@ -16,7 +16,9 @@ from transformers import (
     AutoTokenizer,
     HfArgumentParser,
     TrainerCallback,
+    AutoModelForCausalLM,
 )
+from transformers.modeling_outputs import SequenceClassifierOutput
 
 from optimum.habana import GaudiConfig, GaudiTrainingArguments
 from optimum.habana.trl import GaudiRewardTrainer, RewardDataCollatorWithPadding
@@ -117,7 +119,7 @@ class ScriptArguments:
         },
     )
     merge_adapter_after_train: bool = field(
-        default=False, metadata={"help": "If True, merge reward model LoRA adapter into base after training."}
+        default=True, metadata={"help": "If True, merge reward model LoRA adapter into base after training."}
     )
     merged_output_dir: Optional[str] = field(
         default=None, metadata={"help": "Directory to save merged reward model (defaults to <output_dir>_merged)."}
@@ -141,6 +143,12 @@ if not script_args.tokenizer_name_or_path:
     logger.info(f"tokenizer_name_or_path not provided, using model path: {script_args.tokenizer_name_or_path}")
 
 logger.info(f"ScriptArguments: {script_args}")
+if not script_args.model_name_or_path:
+    raise ValueError("--model_name_or_path is required (no default). Provide a model path or repo id.")
+if script_args.tokenizer_name_or_path is None:
+    script_args.tokenizer_name_or_path = script_args.model_name_or_path
+if not (hasattr(torch, 'hpu') and torch.hpu.is_available()):
+    raise RuntimeError('[HPU][Required] Habana HPU not available. Reward modeling enforces HPU-only execution.')
 set_seed(script_args.seed)
 # Load the human stack-exchange-paired dataset for tuning the reward model.
 train_dataset = load_dataset("lvwerra/stack-exchange-paired", data_dir="data/reward", split="train")
@@ -238,7 +246,10 @@ def _param_stats(m):
     return tot,trn,(trn/tot*100 if tot else 0)
 
 model = get_peft_model(model, peft_config)
-model.print_trainable_parameters()
+try:
+    model.print_trainable_parameters()
+except Exception:
+    pass
 tot,trn,pct=_param_stats(model)
 logger.info(f"[Model Params][After LoRA] total={tot:,} trainable={trn:,} ({pct:.4f}%) (seq_cls={seq_cls_supported})")
 # Need to do this for gpt2, because it doesn't have an official pad token.

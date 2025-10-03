@@ -1,4 +1,4 @@
-# TRL Fine-Tuning & RLHF on Gaudi3
+# TRL Fine-Tuning & RLHF on Gaudi (Gaudi2 / Gaudi3) — Gemma 3 & Llama Support
 
 This directory contains scripts and utilities for fine-tuning and reinforcement learning with language models using HuggingFace TRL, adapted for Habana Gaudi3 hardware.
 
@@ -49,6 +49,7 @@ All steps will run sequentially, with output and logs saved to `ppo_pipeline_san
      ```bash
      python sft.py \
        --model_name_or_path google/gemma-3-270m \
+       --model_name_or_path google/gemma-3-270m \
        --dataset_name lvwerra/stack-exchange-paired \
        --output_dir ./sft_sanity \
        --do_train \
@@ -68,11 +69,12 @@ All steps will run sequentially, with output and logs saved to `ppo_pipeline_san
      ```bash
      python merge_peft_adapter.py \
        --base_model_name "google/gemma-3-270m" \
+       --base_model_name "google/gemma-3-270m" \
        --adapter_model_name "./sft_sanity" \
        --output_name "./sft_sanity_merged"
      ```
 
-3. **Reward Modeling**
+3. **Reward Modeling** (automatic fallback wrapper if SequenceClassification head unsupported)
    - Trains a reward model to score outputs based on human preferences or synthetic feedback. This model is critical for RLHF, as it guides the PPO optimization toward more helpful and aligned responses.
    - Example command (**model_name_or_path is required, tokenizer defaults to model path if not provided**):
      ```bash
@@ -95,11 +97,12 @@ All steps will run sequentially, with output and logs saved to `ppo_pipeline_san
      ```bash
      python merge_peft_adapter.py \
        --base_model_name "google/gemma-3-270m" \
+       --base_model_name "google/gemma-3-270m" \
        --adapter_model_name "./rm_sanity" \
        --output_name "./rm_sanity_merged"
      ```
 
-5. **PPO Training**
+5. **PPO Training** (HPU-only; dynamic output length + adaptive OOM mitigation for Gemma/Llama)
    - Runs PPO RLHF training using the merged SFT and reward models.
    - Example command:
      ```bash
@@ -121,7 +124,7 @@ All steps will run sequentially, with output and logs saved to `ppo_pipeline_san
      ```
      **Note:** `--model_name_or_path` is required. `--tokenizer_name_or_path` defaults to model path if not provided.
 
-6. **Run Generation (Sanity Check)**
+6. **Run Generation (Sanity Check)** (HPU-only; eager attention auto-applied for Gemma3)
    - Uses Proximal Policy Optimization (PPO) to further refine the Llama model, leveraging the reward model to optimize for helpfulness, safety, and alignment. This step produces the final RLHF-tuned model.
    - Example command (**model_name_or_path and prompt are required**):
      ```bash
@@ -142,10 +145,11 @@ All output is logged to `ppo_pipeline_sanity.log` for review and debugging.
 
 ## Comparing Base and PPO Models
 
-After completing the pipeline, you can quantitatively compare the base model and PPO-finetuned model using the provided script:
+After completing the pipeline, you can quantitatively compare the base model and PPO-finetuned model using the provided script (HPU-only; supports Gemma3 & Llama causal models plus merged reward wrapper):
 
 ```bash
 PT_HPU_LAZY_MODE=1 python compare_base_vs_ppo.py \
+  --base_model google/gemma-3-270m \
   --base_model google/gemma-3-270m \
   --finetuned_model ./ppo_sanity \
   --reward_model ./rm_sanity_merged \

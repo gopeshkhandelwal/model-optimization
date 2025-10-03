@@ -31,6 +31,8 @@ assert script_args.adapter_model_name is not None, "please provide the name of t
 assert script_args.base_model_name is not None, "please provide the name of the Base model"
 assert script_args.output_name is not None, "please provide the output name of the merged model"
 
+if not (hasattr(torch, 'hpu') and torch.hpu.is_available()):
+    raise RuntimeError('[HPU][Required] Habana HPU not available. merge_peft_adapter enforces HPU use only.')
 peft_config = PeftConfig.from_pretrained(script_args.adapter_model_name)
 logger.info(f"[Adapter] Loaded PEFT config from {script_args.adapter_model_name} (task_type={peft_config.task_type})")
 if peft_config.task_type == "SEQ_CLS":
@@ -52,7 +54,7 @@ model = PeftModel.from_pretrained(model, script_args.adapter_model_name)
 logger.info(f"[Merge] Adapter weights loaded from {script_args.adapter_model_name}")
 model.eval()
 
-model = model.merge_and_unload()
+model = model.to('hpu').merge_and_unload()
 logger.info("[Merge] merge_and_unload complete -> adapter merged into base model")
 
 model.save_pretrained(f"{script_args.output_name}")

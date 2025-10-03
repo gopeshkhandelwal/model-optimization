@@ -18,6 +18,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
 )
+from transformers.modeling_outputs import SequenceClassifierOutput
 
 from logging_utils import setup_logging
 
@@ -28,6 +29,7 @@ def parse_args():
     p.add_argument("--finetuned_model", "--ppo_model", dest="ppo_model", required=True, help="Fine-tuned/PPO model path (REQUIRED)")
     p.add_argument("--reward_model", required=True, help="Reward model path (REQUIRED)")
     p.add_argument("--max_new_tokens", type=int, default=64)
+    p.add_argument("--reward_max_length", type=int, default=2048, help="Max tokens for reward model scoring (clamped to avoid gigantic model_max_length sentinels).")
     p.add_argument("--seed", type=int, default=None, help="Seed for reproducibility. If unset -> non-deterministic sampling")
     p.add_argument("--do_sample", type=lambda v: str(v).lower() in {"1","true","yes"}, default=True)
     p.add_argument("--top_p", type=float, default=1.0)
@@ -83,8 +85,10 @@ logger.info(
     f"[Init] base_model={base_model} ppo_model={ppo_model} reward_model_path={reward_model_path} seed={args.seed}"
 )
 
-device = "hpu" if hasattr(torch, "hpu") else ("cuda" if torch.cuda.is_available() else "cpu")
-logger.info(f"[Device] Using device={device}")
+if not (hasattr(torch, "hpu") and torch.hpu.is_available()):
+    raise RuntimeError("[HPU][Required] Habana HPU not available. Comparison script requires HPU (no CPU fallback).")
+device = "hpu"
+logger.info(f"[Device] Using enforced device={device}")
 
 # Prompts
 if args.prompts_file and Path(args.prompts_file).is_file():
@@ -212,7 +216,7 @@ def load_causal(path: str):
     logger.info(f"[ModelLoad] Loading causal LM: {path}")
     m = AutoModelForCausalLM.from_pretrained(
         path,
-        torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
+        torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
     m.to(device)

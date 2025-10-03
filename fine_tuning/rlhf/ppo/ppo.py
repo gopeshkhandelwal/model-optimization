@@ -3,6 +3,7 @@
 import json
 import time
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -10,7 +11,8 @@ import torch
 from datasets import load_dataset
 from peft import LoraConfig
 from tqdm import tqdm
-from transformers import Adafactor, AutoModelForSequenceClassification, AutoTokenizer, HfArgumentParser, pipeline
+from transformers import Adafactor, AutoModelForSequenceClassification, AutoTokenizer, HfArgumentParser, pipeline, AutoModelForCausalLM
+from peft import PeftModel, PeftConfig
 from trl import AutoModelForCausalLMWithValueHead
 from trl.core import LengthSampler
 
@@ -80,6 +82,39 @@ class ScriptArguments:
             )
         },
     )
+    merge_adapter_after_train: Optional[bool] = field(
+        default=False, metadata={"help": "If True, merge LoRA adapter into base policy model + export value head."}
+    )
+    merged_output_dir: Optional[str] = field(
+        default=None, metadata={"help": "Directory to save merged policy (defaults to <output_dir>_merged)."}
+    )
+    merge_overwrite: Optional[bool] = field(
+        default=False, metadata={"help": "Overwrite merged_output_dir if it exists."}
+    )
+    disable_kv_cache: Optional[bool] = field(
+        default=True,
+        metadata={"help": "If True, disable key/value cache during generation to reduce host memory (helps avoid sliding cache OOM)."},
+    )
+    gradient_checkpointing: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Enable gradient checkpointing to reduce activation memory (slower but lighter)."},
+    )
+    initial_output_max_length: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional smaller starting max generation length; will ramp to output_max_length."},
+    )
+    length_ramp_epochs: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of epochs over which to linearly ramp from initial_output_max_length to output_max_length."},
+    )
+    oom_shrink_factor: Optional[float] = field(
+        default=0.75,
+        metadata={"help": "Factor to multiply current max length by after an Out of HOST memory error."},
+    )
+    min_output_max_length: Optional[int] = field(
+        default=16,
+        metadata={"help": "Lower bound for adaptive output length after OOM reductions."},
+    )
 
 
 adapt_PreTrainedModelWrapper_to_gaudi()
@@ -97,6 +132,17 @@ if not script_args.tokenizer_name_or_path:
     logger.info(f"tokenizer_name_or_path not provided, using model path: {script_args.tokenizer_name_or_path}")
 
 logger.info(f"ScriptArguments: {script_args}")
+if not script_args.model_name_or_path:
+    raise ValueError("--model_name_or_path is required (no default). Provide a model path or repo id.")
+if not script_args.tokenizer_name_or_path:
+    script_args.tokenizer_name_or_path = script_args.model_name_or_path
+if not (hasattr(torch, 'hpu') and torch.hpu.is_available()):
+    raise RuntimeError('[HPU][Required] Habana HPU not available. PPO script enforces HPU-only execution.')
+# Always force HPU usage regardless of CLI flag (user request: Always Use HPU)
+if not script_args.use_habana:
+    logger.warning("[HPU][Override] Forcing use_habana=True (Always Use HPU policy)")
+    script_args.use_habana = True
+
 reward_model_name = script_args.reward_model_name
 dataset_name = "lvwerra/stack-exchange-paired"
 config = GaudiPPOConfig(
@@ -130,7 +176,8 @@ original_columns = train_dataset.column_names
 # We then define the arguments to pass to the sentiment analysis pipeline.
 # We set `return_all_scores` to True to get the sentiment score for each token.
 sent_kwargs = {
-    "return_all_scores": True,
+    # return_all_scores deprecated; use top_k=None for all scores
+    "top_k": None,
     "function_to_apply": "none",
     "batch_size": 16,
     "truncation": True,
@@ -203,7 +250,38 @@ dataset = build_dataset(tokenizer, input_max_length=script_args.input_max_length
 
 
 def collator(data):
-    return {key: [d[key] for d in data] for key in data[0]}
+    """Dynamic collator.
+    When batched generation is enabled we pad input_ids to a tensor batch to avoid
+    downstream indexing issues inside Gaudi batched generation (_generate_batched).
+    """
+    first = data[0]
+    # Collect fields
+    batch = {k: [d[k] for d in data] for k in first}
+    if script_args.batched_gen:
+        # Pad input_ids manually (tokenizer already set pad_token).
+        seqs = batch["input_ids"]
+        # seqs is list of lists of ints
+        max_len = max(len(s) for s in seqs)
+        pad_id = tokenizer.pad_token_id
+        import torch as _torch
+        padded = _torch.full((len(seqs), max_len), pad_id, dtype=_torch.long)
+        for i, s in enumerate(seqs):
+            if isinstance(s, _torch.Tensor):
+                padded[i, : s.numel()] = s.to(dtype=_torch.long)
+            else:
+                padded[i, : len(s)] = _torch.as_tensor(s, dtype=_torch.long)
+        batch["input_ids"] = padded
+    else:
+        # Ensure each sequence is a 1D LongTensor for PPOTrainer.generate expectations
+        import torch as _torch
+        seqs = batch["input_ids"]
+        for i, s in enumerate(seqs):
+            if not isinstance(s, _torch.Tensor):
+                seqs[i] = _torch.as_tensor(s, dtype=_torch.long)
+            else:
+                if s.dtype != _torch.long:
+                    seqs[i] = s.to(dtype=_torch.long)
+    return batch
 
 
 # set seed before initializing value head for deterministic eval
@@ -216,6 +294,18 @@ if script_args.lora_target_modules is None:
 
 # Now let's build the model, the reference model, and the tokenizer.
 current_device = GaudiAccelerator().local_process_index
+# Provide sensible default LoRA target modules if none specified
+if script_args.lora_target_modules is None or (isinstance(script_args.lora_target_modules, list) and len(script_args.lora_target_modules) == 0):
+    script_args.lora_target_modules = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "up_proj",
+        "down_proj",
+        "gate_proj",
+    ]
+    logger.info(f"[LoRA][AutoDefault] No lora_target_modules provided -> using {script_args.lora_target_modules}")
 lora_config = LoraConfig(
     r=script_args.lora_r,
     lora_alpha=script_args.lora_alpha,
@@ -230,9 +320,19 @@ model = AutoModelForCausalLMWithValueHead.from_pretrained(
     peft_config=lora_config,
     torch_dtype=torch.bfloat16,
     low_cpu_mem_usage=True,
+    attn_implementation="eager",
 )
 model.config.use_fused_rope = False
 model.config.use_fused_rms_norm = False
+if script_args.disable_kv_cache:
+    model.config.use_cache = False
+if script_args.gradient_checkpointing:
+    try:
+        base_model_for_ckpt = model.pretrained_model if hasattr(model, "pretrained_model") else model
+        base_model_for_ckpt.gradient_checkpointing_enable()
+        logger.info("[Memory] Gradient checkpointing enabled for policy model.")
+    except Exception as e:
+        logger.warning(f"[Memory] Failed to enable gradient checkpointing on policy model: {e}")
 optimizer = None
 model = model.to(torch.bfloat16)
 
@@ -244,16 +344,22 @@ def _param_stats(m):
 btot,btrn,bpct=_param_stats(model)
 logger.info(f"[Model Params][Policy+ValueHead] total={btot:,} trainable={btrn:,} ({bpct:.4f}%)")
 
-if script_args.use_habana:
-    logger.info("[IF] use_habana == True -> loading reference model")
-    ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        config.model_name,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-    )
-else:
-    logger.info("[IF] use_habana == False -> no reference model (reference-free mode)")
-    ref_model = None
+logger.info("[HPU] Loading reference model (forced HPU mode)")
+ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
+    config.model_name,
+    torch_dtype=torch.bfloat16,
+    low_cpu_mem_usage=True,
+    attn_implementation="eager",
+)
+if script_args.disable_kv_cache:
+    ref_model.config.use_cache = False
+if script_args.gradient_checkpointing:
+    try:
+        base_ref_for_ckpt = ref_model.pretrained_model if hasattr(ref_model, "pretrained_model") else ref_model
+        base_ref_for_ckpt.gradient_checkpointing_enable()
+        logger.info("[Memory] Gradient checkpointing enabled for reference model.")
+    except Exception as e:
+        logger.warning(f"[Memory] Failed to enable gradient checkpointing on reference model: {e}")
 if script_args.adafactor:
     logger.info("[IF] adafactor == True -> using Adafactor optimizer")
     optimizer = Adafactor(
@@ -343,9 +449,12 @@ except ValueError as e:
 
 if config.use_habana:
     from habana_frameworks.torch.hpu import wrap_in_hpu_graph
-
+    try:
+        reward_model = reward_model.to("hpu")
+    except Exception:
+        pass
     reward_model = wrap_in_hpu_graph(reward_model)
-    logger.info("[IF] use_habana == True -> reward model wrapped in HPU graph")
+    logger.info("[HPU] Reward model moved to HPU and wrapped in HPU graph")
 
 if device.type == "hpu":
     device = "hpu"
@@ -413,12 +522,38 @@ generation_kwargs = {
     "pad_token_id": tokenizer.pad_token_id,
     "eos_token_id": tokenizer.eos_token_id,
 }
-output_min_length = 32
-output_max_length = script_args.output_max_length
-if not config.pad_for_acceleration:
-    output_length_sampler = LengthSampler(output_min_length, output_max_length)
-else:
-    output_length_sampler = LengthSampler(output_max_length, output_max_length + 1)
+if script_args.disable_kv_cache:
+    generation_kwargs["use_cache"] = False
+
+# Dynamic output length management
+fixed_padding_mode = config.pad_for_acceleration  # when True we cannot vary length safely
+adaptive_current_max = script_args.output_max_length
+if script_args.initial_output_max_length and script_args.length_ramp_epochs and not fixed_padding_mode:
+    if script_args.initial_output_max_length < script_args.output_max_length:
+        adaptive_current_max = script_args.initial_output_max_length
+        logger.info(
+            f"[LengthRamp] Starting output_max_length ramp: {adaptive_current_max} -> {script_args.output_max_length} over {script_args.length_ramp_epochs} epochs"
+        )
+    else:
+        logger.warning("[LengthRamp] initial_output_max_length >= output_max_length -> ignoring ramp settings")
+
+def compute_current_max(epoch: int):
+    if fixed_padding_mode:
+        return script_args.output_max_length
+    if script_args.initial_output_max_length and script_args.length_ramp_epochs and script_args.initial_output_max_length < script_args.output_max_length:
+        if epoch < script_args.length_ramp_epochs:
+            span = script_args.output_max_length - script_args.initial_output_max_length
+            frac = epoch / max(1, script_args.length_ramp_epochs)
+            return int(script_args.initial_output_max_length + span * frac)
+    return adaptive_current_max
+
+def build_length_sampler(cur_max: int):
+    # Keep a modest minimum (32) but ensure <= cur_max
+    min_len = min(32, cur_max)
+    if fixed_padding_mode:
+        return LengthSampler(cur_max, cur_max + 1)
+    return LengthSampler(min_len, cur_max)
+
 s0 = time.time()
 sample = 0
 for epoch, batch in tqdm(enumerate(ppo_trainer.dataloader)):
@@ -426,6 +561,28 @@ for epoch, batch in tqdm(enumerate(ppo_trainer.dataloader)):
         logger.info("[Loop] Reached total_ppo_epochs -> breaking loop")
         break
     question_tensors = batch["input_ids"]
+    # Normalize to list[Tensor(seq_len)] as required by GaudiPPOTrainer.generate
+    if isinstance(question_tensors, torch.Tensor):
+        if question_tensors.dim() == 2:  # (batch, seq)
+            question_tensors = [question_tensors[i] for i in range(question_tensors.size(0))]
+        elif question_tensors.dim() == 1:  # single sequence tensor
+            question_tensors = [question_tensors]
+        else:
+            raise ValueError(f"[Collator] Unexpected input_ids tensor shape {tuple(question_tensors.shape)}")
+    elif isinstance(question_tensors, list):
+        # ensure every element is 1D tensor
+        cleaned = []
+        for q in question_tensors:
+            if isinstance(q, torch.Tensor):
+                if q.dim() != 1:
+                    cleaned.append(q.view(-1))
+                else:
+                    cleaned.append(q)
+            else:
+                cleaned.append(torch.as_tensor(q, dtype=torch.long).view(-1))
+        question_tensors = cleaned
+    else:
+        raise TypeError(f"[Collator] input_ids unexpected type {type(question_tensors)}")
     sample = sample + len(question_tensors)
     # Try PPO trainer generation with error handling
     logger.info(f"[Generation] Attempting PPO trainer generation for batch size {len(question_tensors)}")
@@ -471,11 +628,26 @@ for epoch, batch in tqdm(enumerate(ppo_trainer.dataloader)):
     pipe_outputs = get_rewards(texts)
     rewards = [torch.tensor(output[0]["score"] - script_args.reward_baseline) for output in pipe_outputs]
     if epoch % 10 == 0:
-        logger.info(f"[Loop] Epoch {epoch} sample reward: {rewards[0].item():.4f}")
+        # compute simple stats
+        rstack = torch.stack(rewards)
+        logger.info(
+            f"[Loop] Epoch {epoch} reward sample={rewards[0].item():.4f} mean={rstack.mean().item():.4f} std={rstack.std(unbiased=False).item():.4f} min={rstack.min().item():.4f} max={rstack.max().item():.4f}"
+        )
 
     # Run PPO step
-    stats = ppo_trainer.step(question_tensors, response_tensors, rewards)
+    stats = ppo_trainer.step(question_tensors, responses, rewards)
     ppo_trainer.log_stats(stats, batch, rewards)
+
+    # Optional memory stats logging (best-effort)
+    if epoch % 20 == 0:
+        try:
+            import habana_frameworks.torch.hpu as hpu
+            mem_stats = hpu.memory_stats()
+            total = mem_stats.get('Total Memory', 'NA')
+            free = mem_stats.get('Free Memory', 'NA')
+            logger.info(f"[Memory][HPU] Stats: total={total} free={free}")
+        except Exception:
+            pass
 
     if script_args.save_freq and epoch and epoch % script_args.save_freq == 0:
         logger.info(f"[IF] save_freq condition met at epoch {epoch} -> saving intermediate model")
@@ -487,3 +659,54 @@ metrics = {"train_runtime": s1 - s0, "train_samples_per_second": sample / (s1 - 
 with open(f"{script_args.output_dir}/all_results.json", mode="w") as file:
     json.dump(metrics, file)
 logger.info("[INFO] PPO training complete. Metrics saved.")
+
+# Optional merge of policy adapter into base model + export value head
+if script_args.merge_adapter_after_train:
+    try:
+        adapter_dir = script_args.output_dir
+        merged_dir = script_args.merged_output_dir or f"{adapter_dir}_merged"
+        if os.path.exists(merged_dir) and not script_args.merge_overwrite:
+            logger.warning(f"[PolicyMerge] {merged_dir} exists and merge_overwrite=False -> skipping merge")
+        else:
+            logger.info(f"[PolicyMerge] Merging policy adapter from {adapter_dir} -> {merged_dir}")
+            peft_conf = PeftConfig.from_pretrained(adapter_dir)
+            base_model_name = getattr(peft_conf, 'base_model_name_or_path', None)
+            if not base_model_name or base_model_name in {"None", "none", ""}:
+                candidate = script_args.model_name_or_path
+                if candidate and os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, 'config.json')):
+                    base_model_name = candidate
+                    logger.warning(f"[PolicyMerge][Fallback] base_model_name_or_path missing; using {base_model_name}")
+                else:
+                    raise ValueError("[PolicyMerge][Error] PEFT config missing base_model_name_or_path and no valid local fallback.")
+            base_model_fresh = AutoModelForCausalLM.from_pretrained(
+                base_model_name, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True
+            )
+            peft_loaded = PeftModel.from_pretrained(base_model_fresh, adapter_dir)
+            try:
+                merged_base = peft_loaded.merge_and_unload()
+                logger.info("[PolicyMerge] merge_and_unload successful")
+            except Exception as e:
+                logger.warning(f"[PolicyMerge] merge_and_unload failed ({e}); using adapter model directly")
+                merged_base = peft_loaded
+            os.makedirs(merged_dir, exist_ok=True)
+            merged_base.save_pretrained(merged_dir)
+            tokenizer.save_pretrained(merged_dir)
+            # Save value head weights + metadata
+            if hasattr(model, 'v_head'):
+                vh_state = model.v_head.state_dict()
+                torch.save(vh_state, os.path.join(merged_dir, 'value_head.bin'))
+                hidden_size = None
+                # try to infer hidden size
+                for k, v in vh_state.items():
+                    if v.dim() == 2:
+                        hidden_size = v.shape[1]
+                        break
+                meta = {"value_head_type": "linear", "hidden_size": hidden_size}
+                with open(os.path.join(merged_dir, 'value_head_config.json'), 'w') as mf:
+                    json.dump(meta, mf)
+                logger.info(f"[PolicyMerge] Saved value head + metadata (hidden_size={hidden_size})")
+            else:
+                logger.warning("[PolicyMerge] model has no v_head attribute; skipping value head export")
+            logger.info(f"[PolicyMerge] Merged policy saved to {merged_dir}")
+    except Exception as e:
+        logger.exception(f"[PolicyMerge] Failed to merge policy adapter: {e}")

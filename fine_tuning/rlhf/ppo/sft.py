@@ -84,6 +84,13 @@ class ScriptArguments:
 if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, GaudiSFTConfig))
     script_args, training_args = parser.parse_args_into_dataclasses()
+    if not script_args.model_name_or_path:
+        raise ValueError("--model_name_or_path is required (no default). Provide a model path or repo id.")
+    if not (hasattr(torch, 'hpu') and torch.hpu.is_available()):
+        raise RuntimeError('[HPU][Required] Habana HPU not available. SFT script enforces HPU-only execution.')
+    if getattr(training_args, 'use_habana', False) is False:
+        logging.getLogger(__name__).warning('[HPU][Override] Forcing use_habana=True (Always Use HPU policy)')
+        training_args.use_habana = True
     setup_logging()
     
     # Validate required arguments
@@ -183,6 +190,12 @@ if __name__ == "__main__":
         torch_dtype=torch.bfloat16,
         token=script_args.token,
     )
+    mt = getattr(base_model.config, 'model_type', '')
+    if mt.startswith('gemma3'):
+        try:
+            base_model.config.attn_implementation = 'eager'
+        except Exception:
+            pass
 
     # --- Parameter statistics before (and later after) PEFT injection ---
     def _param_stats(model):
