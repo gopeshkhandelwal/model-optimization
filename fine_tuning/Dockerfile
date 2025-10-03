@@ -8,17 +8,28 @@ RUN pip install --upgrade pip && \
     pip install \
         optimum-habana==1.18.1 \
         transformers==4.51.0 \
-        datasets \
+        datasets==2.19.2 \
         pyarrow \
         rouge_score \
         nltk \
         evaluate \
-        peft \
-        trl==0.19.1 \
-        accelerate>=0.33
+        peft==0.12.0 \
+        trl==0.9.6 \
+        accelerate>=0.33 \
+        sentencepiece!=0.1.92 \
+        scipy \
+        scikit-learn==1.5.2 \
+        protobuf \
+        torch>=1.3 \
+        tyro
+
+RUN pip install git+https://github.com/HabanaAI/DeepSpeed.git@1.21.0
 
 # Copy all POC step scripts into container
 COPY *.py /workspace/
+
+# Copy rlhf directory structure
+COPY rlhf/ /workspace/rlhf/
 
 # Default command
 CMD ["/bin/bash"]

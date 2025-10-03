@@ -42,6 +42,16 @@ banner() {
   echo "============================================================"
 }
 
+# Base model (now mandatory: pass as first arg OR export MODEL_NAME)
+MODEL_NAME="${1:-${MODEL_NAME:-}}"
+if [ -z "${MODEL_NAME}" ]; then
+  echo "ERROR: Base model not specified. Provide as first argument or export MODEL_NAME."
+  echo "Usage: MODEL_NAME=google/gemma-3-270m ./ppo_pipeline_sanity.sh" >&2
+  echo "   or: ./ppo_pipeline_sanity.sh google/gemma-3-270m" >&2
+  exit 1
+fi
+echo "[CONFIG] MODEL_NAME=${MODEL_NAME}"
+
 # Common HPU env vars
 export PT_HPU_DISABLE_FUSED_ADAMW=1
 export PT_HPU_DISABLE_FUSED_ADAM=1
@@ -50,6 +60,7 @@ export PT_HPU_ENABLE_REFINE_DYNAMIC_SHAPES=0
 banner "STEP 1: Supervised Fine-Tuning (SFT + Merge Inline)"
 time_step_begin SFT
 python sft.py \
+  --model_name_or_path "${MODEL_NAME}" \
   --model_name_or_path "${MODEL_NAME}" \
   --dataset_name lvwerra/stack-exchange-paired \
   --output_dir ./sft_sanity \
@@ -77,6 +88,7 @@ banner "STEP 2: Reward Modeling (Inline Merge)"
 time_step_begin RM
 python reward_modeling.py \
   --model_name_or_path ./sft_sanity_merged \
+  --tokenizer_name_or_path "${MODEL_NAME}" \
   --tokenizer_name_or_path "${MODEL_NAME}" \
   --output_dir ./rm_sanity \
   --optim adamw_torch \
@@ -109,26 +121,26 @@ banner "STEP 3: PPO Training"
 time_step_begin PPO
 PT_HPU_LAZY_MODE=1 python ppo.py \
   --model_name_or_path ./sft_sanity_merged \
-  --reward_model_name "${REWARD_FOR_PPO}" \
+  --reward_model_name ./rm_sanity_merged \
   --tokenizer_name_or_path "${MODEL_NAME}" \
   --output_dir ./ppo_sanity \
   --batch_size 2 \
   --mini_batch_size 1 \
   --gradient_accumulation_steps 1 \
   --ppo_epochs 1 \
-  --steps 64 \
+  --steps 5 \
   --input_max_length 256 \
-  --output_max_length 64 \
+  --output_max_length 32 \
   --learning_rate 1.4e-5 \
   --early_stopping True \
   --batched_gen True \
-  --max_train_samples 256 \
-  $( [ "${PPO_MERGE_POLICY}" = "1" ] && echo "--merge_adapter_after_train --merged_output_dir ${POLICY_MERGED_DIR}" )
+  --max_train_samples 32
 time_step_end PPO
 
 banner "STEP 4: Comparing Base and PPO Models"
 time_step_begin COMPARE
 PT_HPU_LAZY_MODE=1 python compare_base_vs_ppo.py \
+  --base_model "${MODEL_NAME}" \
   --base_model "${MODEL_NAME}" \
   --finetuned_model ./ppo_sanity \
   --reward_model "${REWARD_FOR_PPO}" \
