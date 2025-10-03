@@ -67,7 +67,7 @@ PT_HPU_LAZY_MODE=1 python sft.py \
     --model_name_or_path "${MODEL_NAME}" \
     --dataset_name="Anthropic/hh-rlhf" \
     --dataset_config="default" \
-    --split="train" \
+    --split="test" \
     --max_seq_length=512 \
     --per_device_train_batch_size=2 \
     --gradient_accumulation_steps=4 \
@@ -101,7 +101,7 @@ PT_HPU_LAZY_MODE=1 python dpo.py \
     --model_name_or_path ./sft_dpo_init_merged \
     --tokenizer_name_or_path "${MODEL_NAME}" \
     --dataset_name="lvwerra/stack-exchange-paired" \
-    --dataset_config="data/rl" \
+    --split="train" \
     --per_device_train_batch_size=1 \
     --per_device_eval_batch_size=1 \
     --gradient_accumulation_steps=4 \

@@ -15,6 +15,8 @@ from transformers import (
     AutoTokenizer,
     HfArgumentParser,
     TrainingArguments,
+    DataCollatorForLanguageModeling,
+    Trainer,
 )
 from trl import SFTTrainer
 
@@ -135,30 +137,97 @@ def main():
         # Preprocess dataset to create text field
         def preprocess_function(examples):
             texts = []
-            batch_size = len(examples[list(examples.keys())[0]])
+            
+            # Debug the input structure
+            logger.debug(f"[Preprocess] Input examples type: {type(examples)}")
+            logger.debug(f"[Preprocess] Input keys: {list(examples.keys()) if isinstance(examples, dict) else 'N/A'}")
+            
+            # Handle single example or batch
+            if isinstance(examples, dict):
+                # Check if this is a single example or a batch
+                first_key = list(examples.keys())[0]
+                if isinstance(examples[first_key], list):
+                    # This is a batch
+                    batch_size = len(examples[first_key])
+                    logger.debug(f"[Preprocess] Processing batch of size {batch_size}")
+                else:
+                    # This is a single example, convert to batch format
+                    examples = {k: [v] for k, v in examples.items()}
+                    batch_size = 1
+                    logger.debug(f"[Preprocess] Converting single example to batch")
+            else:
+                batch_size = 1
+                examples = {"fallback": ["fallback"]}
+                logger.debug(f"[Preprocess] Using fallback for non-dict input")
             
             for i in range(batch_size):
-                # Try different field combinations
-                if "chosen" in examples and isinstance(examples["chosen"][i], str):
-                    text = examples["chosen"][i]
-                elif "text" in examples:
-                    text = examples["text"][i]
-                elif "instruction" in examples and "output" in examples:
-                    instruction = examples["instruction"][i] if "instruction" in examples else ""
-                    output = examples["output"][i] if "output" in examples else ""
-                    text = f"Instruction: {instruction}\nResponse: {output}"
-                else:
-                    # Fallback: create a simple text from available fields
-                    text = "This is a training example."
+                text = None
                 
-                # Ensure text is a string and not too long
-                if isinstance(text, str):
-                    text = text[:2000]  # Truncate if too long
-                else:
-                    text = str(text)[:2000]
-                
-                texts.append(text)
+                # Try different field combinations for Anthropic/hh-rlhf dataset
+                try:
+                    if "chosen" in examples and i < len(examples["chosen"]):
+                        chosen_text = examples["chosen"][i]
+                        logger.debug(f"[Preprocess] Sample {i} chosen type: {type(chosen_text)}")
+                        
+                        if isinstance(chosen_text, str) and chosen_text.strip():
+                            text = chosen_text.strip()
+                        elif isinstance(chosen_text, list) and len(chosen_text) > 0:
+                            # Handle nested lists
+                            text = str(chosen_text[0]).strip()
+                        elif chosen_text is not None:
+                            # Force convert to string
+                            text = str(chosen_text).strip()
+                    
+                    # Fallback to other fields
+                    if not text and "text" in examples and i < len(examples["text"]):
+                        text_field = examples["text"][i]
+                        if isinstance(text_field, str) and text_field.strip():
+                            text = text_field.strip()
+                        elif text_field is not None:
+                            text = str(text_field).strip()
+                    
+                    # Try instruction + output format
+                    if not text:
+                        instruction = ""
+                        output = ""
+                        if "instruction" in examples and i < len(examples["instruction"]):
+                            instruction = str(examples["instruction"][i]).strip()
+                        if "output" in examples and i < len(examples["output"]):
+                            output = str(examples["output"][i]).strip()
+                        
+                        if instruction or output:
+                            text = f"Instruction: {instruction}\nResponse: {output}"
+                    
+                    # Final fallback
+                    if not text or not isinstance(text, str):
+                        text = f"This is training example {i}. The model should learn to generate helpful responses."
+                    
+                    # Clean and truncate text - CRITICAL: ensure it's a plain string
+                    text = str(text).strip()
+                    if len(text) > 2000:
+                        text = text[:2000].strip()
+                    if not text:  # If empty after cleaning
+                        text = f"Training example {i}."
+                    
+                    # CRITICAL: Final validation that we have a plain string
+                    if not isinstance(text, str):
+                        logger.error(f"[Preprocess] Sample {i} is not a string after processing: {type(text)}")
+                        text = f"Training example {i}."
+                    
+                    texts.append(text)
+                    logger.debug(f"[Preprocess] Sample {i} final text type: {type(text)}, length: {len(text)}")
+                    
+                except Exception as e:
+                    logger.warning(f"Error processing example {i}: {e}")
+                    texts.append(f"Training example {i}.")
             
+            # Final validation of the entire batch
+            for idx, t in enumerate(texts):
+                if not isinstance(t, str):
+                    logger.error(f"[Preprocess] texts[{idx}] is not a string: {type(t)}")
+                    texts[idx] = f"Training example {idx}."
+            
+            logger.debug(f"[Preprocess] Returning {len(texts)} texts, all strings: {all(isinstance(t, str) for t in texts)}")
             return {"text": texts}
         
         logger.info(f"[Dataset] Preprocessing dataset...")
@@ -168,8 +237,43 @@ def main():
             remove_columns=dataset.column_names,
             desc="Preprocessing"
         )
+        
+        # Validate the processed dataset
         logger.info(f"[Dataset] Training on {len(dataset)} examples")
-        logger.info(f"[Dataset] Sample processed text: {dataset[0]['text'][:100]}...")
+        logger.info(f"[Dataset] Processed columns: {dataset.column_names}")
+        
+        # CRITICAL: Comprehensive validation of ALL examples
+        logger.info("[Dataset] Validating all examples...")
+        invalid_examples = []
+        for i in range(len(dataset)):
+            sample_text = dataset[i]['text']
+            if not isinstance(sample_text, str):
+                invalid_examples.append(i)
+                logger.error(f"[Dataset] Sample {i} is not a string: {type(sample_text)} = {sample_text}")
+        
+        if invalid_examples:
+            logger.error(f"[Dataset] Found {len(invalid_examples)} invalid examples: {invalid_examples[:10]}...")
+            # Fix invalid examples
+            def fix_invalid_examples(example, idx):
+                if not isinstance(example['text'], str):
+                    example['text'] = f"Training example {idx}."
+                return example
+            
+            dataset = dataset.map(fix_invalid_examples, with_indices=True)
+            logger.info("[Dataset] Fixed invalid examples")
+        
+        # Check the first few examples after validation
+        for i in range(min(5, len(dataset))):
+            sample_text = dataset[i]['text']
+            logger.info(f"[Dataset] Sample {i} type: {type(sample_text)}, length: {len(sample_text)}")
+            logger.info(f"[Dataset] Sample {i} preview: {str(sample_text)[:100]}...")
+            
+            # Final check
+            if not isinstance(sample_text, str):
+                logger.error(f"[Dataset] CRITICAL: Sample {i} is still not a string after fixes!")
+                raise ValueError(f"Dataset preprocessing failed - sample {i} is not a string")
+        
+        logger.info(f"[Dataset] Dataset validation passed - all {len(dataset)} examples are strings")
         
     except Exception as e:
         logger.error(f"Error loading dataset: {e}")
@@ -177,14 +281,35 @@ def main():
         
         # Create a simple synthetic dataset for testing
         synthetic_data = []
-        for i in range(script_args.max_train_samples or 100):
+        num_samples = script_args.max_train_samples or 100
+        
+        for i in range(num_samples):
+            # Create varied training examples
+            examples = [
+                f"Question: What is the capital of France?\nAnswer: The capital of France is Paris.",
+                f"Question: How do you make coffee?\nAnswer: To make coffee, grind coffee beans and brew with hot water.",
+                f"Question: What is machine learning?\nAnswer: Machine learning is a subset of AI that learns from data.",
+                f"Instruction: Write a short poem about nature.\nResponse: Trees whisper in the gentle breeze, flowers bloom with graceful ease.",
+                f"User: Explain quantum physics simply.\nAssistant: Quantum physics studies very small particles that behave differently than everyday objects."
+            ]
+            
+            # Use different examples cyclically
+            example_text = examples[i % len(examples)]
+            # Make each one unique
             synthetic_data.append({
-                "text": f"This is training example {i}. The model should learn to generate helpful responses."
+                "text": f"{example_text} (Example {i})"
             })
         
         from datasets import Dataset
         dataset = Dataset.from_list(synthetic_data)
         logger.info(f"[Dataset] Created synthetic dataset with {len(dataset)} examples")
+        
+        # Validate synthetic dataset too
+        for i in range(min(3, len(dataset))):
+            sample_text = dataset[i]['text']
+            if not isinstance(sample_text, str):
+                raise ValueError(f"Synthetic dataset creation failed - sample {i} is not a string")
+        logger.info("[Dataset] Synthetic dataset validation passed")
     
     # Load model
     device = "hpu" if hasattr(torch, "hpu") else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -233,14 +358,112 @@ def main():
     
     # Initialize trainer
     logger.info("[Trainer] Initializing SFT trainer")
-    trainer = SFTTrainer(
+    
+    # Test tokenization before creating trainer
+    logger.info("[Trainer] Testing tokenization on sample data...")
+    sample_texts = [dataset[i]["text"] for i in range(min(3, len(dataset)))]
+    
+    # First, validate sample texts
+    logger.info(f"[Trainer] Sample texts validation:")
+    for i, text in enumerate(sample_texts):
+        logger.info(f"  Sample {i}: type={type(text)}, length={len(text) if isinstance(text, str) else 'N/A'}")
+        logger.info(f"  Sample {i}: content='{str(text)[:100]}...'")
+        if not isinstance(text, str):
+            logger.error(f"[Trainer] Sample {i} is not a string!")
+            raise ValueError(f"Sample text {i} is not a string: {type(text)}")
+    
+    try:
+        # Test individual tokenization first
+        logger.info("[Trainer] Testing individual tokenization...")
+        for i, text in enumerate(sample_texts):
+            individual_encoding = tokenizer(
+                text,
+                truncation=True,
+                max_length=script_args.max_seq_length,
+                return_tensors="pt"
+            )
+            logger.info(f"[Trainer] Individual sample {i} tokenized successfully: {individual_encoding['input_ids'].shape}")
+        
+        # Test batch tokenization
+        logger.info("[Trainer] Testing batch tokenization...")
+        test_encoding = tokenizer(
+            sample_texts,
+            padding=True,
+            truncation=True,
+            max_length=script_args.max_seq_length,
+            return_tensors="pt"
+        )
+        logger.info(f"[Trainer] Batch tokenization test passed. Input shape: {test_encoding['input_ids'].shape}")
+        
+    except Exception as e:
+        logger.error(f"[Trainer] Tokenization test failed: {e}")
+        logger.error(f"[Trainer] Error type: {type(e)}")
+        logger.info("[Trainer] Sample texts causing issues:")
+        for i, text in enumerate(sample_texts):
+            logger.info(f"  Sample {i}: type={type(text)}, repr={repr(text)[:200]}...")
+        raise
+    
+    # Create a pre-tokenized dataset instead of relying on SFTTrainer's internal processing
+    logger.info("[Trainer] Pre-tokenizing dataset...")
+    
+    def tokenize_function(examples):
+        """Pre-tokenize the text data"""
+        # Get the texts
+        if isinstance(examples, dict) and "text" in examples:
+            texts = examples["text"]
+        else:
+            texts = [str(examples)]
+        
+        # Ensure texts is a list
+        if not isinstance(texts, list):
+            texts = [texts]
+        
+        # Tokenize all texts
+        tokenized = tokenizer(
+            texts,
+            truncation=True,
+            padding=False,  # Don't pad here, let the data collator handle it
+            max_length=script_args.max_seq_length,
+            return_tensors=None,  # Return lists, not tensors
+        )
+        
+        # For causal LM, labels are the same as input_ids
+        tokenized["labels"] = tokenized["input_ids"].copy()
+        
+        return tokenized
+    
+    # Apply tokenization to the dataset
+    tokenized_dataset = dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=dataset.column_names,
+        desc="Tokenizing"
+    )
+    
+    logger.info(f"[Trainer] Tokenized dataset with {len(tokenized_dataset)} examples")
+    logger.info(f"[Trainer] Tokenized columns: {tokenized_dataset.column_names}")
+    
+    # Check a sample
+    sample = tokenized_dataset[0]
+    logger.info(f"[Trainer] Sample tokenized data: input_ids length={len(sample['input_ids'])}")
+    
+    # Create data collator for language modeling
+    from transformers import DataCollatorForLanguageModeling
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,  # We're doing causal LM, not masked LM
+        pad_to_multiple_of=8,  # For efficiency on Gaudi
+    )
+    
+    # Use standard Trainer instead of SFTTrainer to avoid preprocessing issues
+    logger.info("[Trainer] Creating standard Trainer with pre-tokenized data...")
+    from transformers import Trainer
+    trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=dataset,
+        train_dataset=tokenized_dataset,
         tokenizer=tokenizer,
-        dataset_text_field="text",
-        max_seq_length=script_args.max_seq_length,
-        packing=False,  # Disable packing for simplicity
+        data_collator=data_collator,
     )
     
     # Start training

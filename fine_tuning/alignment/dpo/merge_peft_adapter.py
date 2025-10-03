@@ -154,7 +154,8 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         elif hasattr(torch, "hpu") and torch.hpu.is_available():
-            torch.hpu.empty_cache()
+            # HPU doesn't have empty_cache, just skip memory cleanup
+            logger.info("HPU detected - skipping memory cache cleanup")
 
 
 if __name__ == "__main__":

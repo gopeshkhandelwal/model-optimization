@@ -1,8 +1,8 @@
 # Direct Preference Optimization implementation for Gaudi3
 # Customized and enabled for Gaudi3 with Gemma3 support
 import json
-import logging
 import time
+import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -150,11 +150,25 @@ def main():
         
         def format_for_dpo(example):
             """Format a single example for DPO training"""
+            # Handle Anthropic/hh-rlhf format - they already have the right structure
+            if 'chosen' in example and 'rejected' in example:
+                # The dataset already has the right format, just return as-is
+                return example
+            
             # Handle stack-exchange-paired format
-            if 'question' in example and 'response_j' in example and 'response_k' in example:
+            elif 'question' in example and 'response_j' in example and 'response_k' in example:
                 prompt = f"Question: {example['question']}\n\nAnswer:"
-                chosen = example['response_j']  # Higher scored response
-                rejected = example['response_k']  # Lower scored response
+                
+                # Use scores to determine which response is better
+                score_j = example.get('score_j', 0)
+                score_k = example.get('score_k', 0)
+                
+                if score_j >= score_k:
+                    chosen = example['response_j']
+                    rejected = example['response_k']
+                else:
+                    chosen = example['response_k']
+                    rejected = example['response_j']
                 
                 return {
                     'prompt': prompt,
