@@ -47,9 +47,10 @@ For DPO training, see the detailed documentation in `dpo/README.md`.
 Example quick start:
 ```bash
 cd dpo/
-# Build container
 make build
+make run HF_TOKEN=<<YOUR-HF-TOKEN>>
 
 # Run end-to-end pipeline
+chmod +x dpo_pipeline_sanity.sh
 MODEL_NAME=google/gemma-3-270m ./dpo_pipeline_sanity.sh
 ```

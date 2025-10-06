@@ -97,11 +97,42 @@ print_success "PEFT adapter merged"
 print_status "=== Step 2: DPO Training ==="
 print_status "Training with preference data using Direct Preference Optimization"
 
+# Auto-detect available splits for the preference dataset to avoid ExpectedMoreSplits errors
+print_status "Detecting available splits for lvwerra/stack-exchange-paired"
+AVAILABLE_SPLITS=$(python - <<'PY'
+from datasets import load_dataset
+try:
+    ds_dict = load_dataset("lvwerra/stack-exchange-paired")
+    print(" ".join(ds_dict.keys()))
+except Exception as e:
+    print(f"ERROR:{e}")
+PY
+)
+if [[ "$AVAILABLE_SPLITS" == ERROR:* ]]; then
+    print_warning "Could not enumerate dataset splits ($AVAILABLE_SPLITS). Proceeding with fallback logic in dpo.py"
+    PREF_SPLIT="train"
+else
+    print_status "Available splits: $AVAILABLE_SPLITS"
+    PREF_SPLIT="train"
+    for cand in train training train_full train_augmented; do
+        if echo "$AVAILABLE_SPLITS" | grep -qw "$cand"; then PREF_SPLIT="$cand"; break; fi
+    done
+    if [[ "$PREF_SPLIT" == "train" ]]; then
+        # If no explicit train-like split, choose test or first
+        if echo "$AVAILABLE_SPLITS" | grep -qw test; then
+            PREF_SPLIT="test"
+        else
+            PREF_SPLIT=$(echo "$AVAILABLE_SPLITS" | awk '{print $1}')
+        fi
+    fi
+fi
+print_status "Using preference training split: $PREF_SPLIT"
+
 PT_HPU_LAZY_MODE=1 python dpo.py \
     --model_name_or_path ./sft_dpo_init_merged \
     --tokenizer_name_or_path "${MODEL_NAME}" \
     --dataset_name="lvwerra/stack-exchange-paired" \
-    --split="train" \
+    --split="${PREF_SPLIT}" \
     --per_device_train_batch_size=1 \
     --per_device_eval_batch_size=1 \
     --gradient_accumulation_steps=4 \
@@ -117,6 +148,8 @@ PT_HPU_LAZY_MODE=1 python dpo.py \
     --logging_steps=10 \
     --save_steps=50 \
     --eval_steps=50 \
+    --eval_fraction=0.02 \
+    --datasets_verification_mode=no_checks \
     --output_dir=./dpo_sanity \
     --gradient_checkpointing=True \
     --use_peft=True \
