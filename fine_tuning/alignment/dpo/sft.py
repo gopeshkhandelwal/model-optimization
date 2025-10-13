@@ -88,6 +88,7 @@ class ScriptArguments:
         default='all_checks',
         metadata={"help": "HF datasets verification mode: 'no_checks', 'basic_checks', or 'all_checks'."},
     )
+    demo_fast: Optional[bool] = field(default=False, metadata={"help": "Enable ultra-fast demo mode (tiny data & steps)."})
 
 
 def parse_args():
@@ -115,6 +116,46 @@ def main():
         logger.info(f"tokenizer_name_or_path not provided, using model path: {script_args.tokenizer_name_or_path}")
     
     logger.info(f"ScriptArguments: {script_args}")
+
+    # ---------------------------
+    # Demo fast overrides
+    # ---------------------------
+    if script_args.demo_fast:
+        logger.warning("[DemoFast][SFT] Activating fast demo overrides: limiting data & steps for <20m pipeline.")
+        # Prefer fixed steps over epochs
+        if script_args.max_steps == -1 or script_args.max_steps > 20:
+            logger.info("[DemoFast][SFT] Setting max_steps=20")
+            script_args.max_steps = 20
+        # Limit train samples
+        if script_args.max_train_samples is None or script_args.max_train_samples > 50:
+            script_args.max_train_samples = 50
+            logger.info("[DemoFast][SFT] Setting max_train_samples=50")
+        # Disable eval creation
+        script_args.eval_fraction = 0.0
+        script_args.num_train_epochs = 1
+        # Reduce batch / accumulation
+        script_args.per_device_train_batch_size = min(script_args.per_device_train_batch_size, 2)
+        script_args.gradient_accumulation_steps = 1
+        # Shorter seq length
+        if script_args.max_seq_length > 384:
+            script_args.max_seq_length = 384
+            logger.info("[DemoFast][SFT] Reducing max_seq_length=384")
+        # Reduce warmup
+        if script_args.warmup_steps > 2:
+            script_args.warmup_steps = 2
+            logger.info("[DemoFast][SFT] Setting warmup_steps=2")
+        # Smaller LoRA rank if large
+        if script_args.use_peft and script_args.lora_r > 16:
+            script_args.lora_r = 16
+            logger.info("[DemoFast][SFT] Setting lora_r=16")
+        # Higher logging cadence for quick feedback
+        if script_args.logging_steps > 5:
+            script_args.logging_steps = 5
+            logger.info("[DemoFast][SFT] Setting logging_steps=5")
+        # Force verification off to skip dataset checks
+        if script_args.datasets_verification_mode != 'no_checks':
+            script_args.datasets_verification_mode = 'no_checks'
+            logger.info("[DemoFast][SFT] Setting datasets_verification_mode=no_checks")
     
     # Set seed
     set_seed(script_args.seed)

@@ -44,13 +44,26 @@ Traditional RLHF (in `../rlhf/`) uses reinforcement learning with separate rewar
 
 For DPO training, see the detailed documentation in `dpo/README.md`.
 
-Example quick start:
+Example quick start (interactive shell + manual pipeline):
 ```bash
 cd dpo/
 make build
-make run HF_TOKEN=<<YOUR-HF-TOKEN>>
+make run HF_TOKEN=<<YOUR-HF-TOKEN>> MODEL_NAME=google/gemma-3-270m
 
-# Run end-to-end pipeline
-chmod +x dpo_pipeline_sanity.sh
-MODEL_NAME=google/gemma-3-270m ./dpo_pipeline_sanity.sh
+# Inside container (if not auto-run)
+./dpo_pipeline_sanity.sh google/gemma-3-270m
 ```
+
+Automated pipeline targets (recommended):
+```bash
+# Standard speed
+make run-pipeline HF_TOKEN=<<YOUR-HF-TOKEN>> MODEL_NAME=google/gemma-3-270m
+
+# Fast demo mode (<~20 min) with reduced steps & samples
+make run-pipeline-fast HF_TOKEN=<<YOUR-HF-TOKEN>> MODEL_NAME=google/gemma-3-270m
+```
+
+Fast mode details:
+- Enables internal `--demo_fast` overrides in `sft.py`, `dpo.py`, `compare_base_vs_dpo.py`.
+- Shrinks sequence lengths, steps, and sample counts; disables eval loops for speed.
+- Suitable for stakeholder demos, not for final quality training.

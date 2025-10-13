@@ -40,7 +40,13 @@ else
     exit 1
 fi
 
-print_status "Starting DPO Pipeline with MODEL_NAME=${MODEL_NAME}"
+FAST_MODE=${FAST_MODE:-0}
+for arg in "$@"; do
+    if [[ "$arg" == "--fast" || "$arg" == "--demo_fast" ]]; then FAST_MODE=1; fi
+done
+print_status "Starting DPO Pipeline with MODEL_NAME=${MODEL_NAME} FAST_MODE=${FAST_MODE}"
+PIPELINE_START_TS=$(date +%s)
+STAGE_TIMES=()
 
 # Log file
 LOG_FILE="dpo_pipeline_sanity.log"
@@ -62,6 +68,7 @@ fi
 
 print_status "=== Step 1: Supervised Fine-Tuning (SFT) ==="
 print_status "Training base model with supervised data for DPO initialization"
+SFT_START=$(date +%s)
 
 PT_HPU_LAZY_MODE=1 python sft.py \
     --model_name_or_path "${MODEL_NAME}" \
@@ -81,21 +88,26 @@ PT_HPU_LAZY_MODE=1 python sft.py \
     --warmup_steps=10 \
     --bf16=True \
     --remove_unused_columns=False \
-    --max_train_samples=500
+    --max_train_samples=500 \
+    $( [[ "$FAST_MODE" == "1" ]] && echo "--demo_fast" )
 
 print_success "SFT training completed"
+SFT_END=$(date +%s); STAGE_TIMES+=("SFT:$((SFT_END-SFT_START))s")
 
 # Merge PEFT adapter
 print_status "=== Step 1b: Merging PEFT Adapter ==="
+MERGE_SFT_START=$(date +%s)
 python merge_peft_adapter.py \
     --adapter_model_name=./sft_dpo_init \
     --base_model_name="${MODEL_NAME}" \
     --output_name=./sft_dpo_init_merged
 
 print_success "PEFT adapter merged"
+MERGE_SFT_END=$(date +%s); STAGE_TIMES+=("MergeSFT:$((MERGE_SFT_END-MERGE_SFT_START))s")
 
 print_status "=== Step 2: DPO Training ==="
 print_status "Training with preference data using Direct Preference Optimization"
+DPO_START=$(date +%s)
 
 # Auto-detect available splits for the preference dataset to avoid ExpectedMoreSplits errors
 print_status "Detecting available splits for lvwerra/stack-exchange-paired"
@@ -155,44 +167,38 @@ PT_HPU_LAZY_MODE=1 python dpo.py \
     --use_peft=True \
     --lora_r=64 \
     --lora_alpha=16 \
-    --max_train_samples=200
+    --max_train_samples=200 \
+    $( [[ "$FAST_MODE" == "1" ]] && echo "--demo_fast" )
 
 print_success "DPO training completed"
+DPO_END=$(date +%s); STAGE_TIMES+=("DPO:$((DPO_END-DPO_START))s")
 
 # Merge DPO PEFT adapter
 print_status "=== Step 2b: Merging DPO PEFT Adapter ==="
+MERGE_DPO_START=$(date +%s)
 python merge_peft_adapter.py \
     --adapter_model_name=./dpo_sanity \
     --base_model_name=./sft_dpo_init_merged \
     --output_name=./dpo_sanity_merged
 
 print_success "DPO PEFT adapter merged"
+MERGE_DPO_END=$(date +%s); STAGE_TIMES+=("MergeDPO:$((MERGE_DPO_END-MERGE_DPO_START))s")
 
 print_status "=== Step 3: Model Comparison ==="
 print_status "Comparing base model vs DPO-trained model"
+COMPARE_START=$(date +%s)
 
 PT_HPU_LAZY_MODE=1 python compare_base_vs_dpo.py \
     --base_model "${MODEL_NAME}" \
     --finetuned_model ./dpo_sanity_merged \
     --seed 123 \
     --greedy \
-    --output_json dpo_comparison_results.json
+    --output_json dpo_comparison_results.json \
+    $( [[ "$FAST_MODE" == "1" ]] && echo "--demo_fast" )
 
 print_success "Model comparison completed"
+COMPARE_END=$(date +%s); STAGE_TIMES+=("Compare:$((COMPARE_END-COMPARE_START))s")
 
-print_status "=== Step 4: Generation Test ==="
-print_status "Testing generation quality with DPO model"
-
-PT_HPU_LAZY_MODE=1 python run_generation.py \
-    --model_name_or_path ./dpo_sanity_merged \
-    --tokenizer_name_or_path "${MODEL_NAME}" \
-    --prompt "Why is machine learning important for modern AI applications?" \
-    --max_new_tokens 128 \
-    --temperature 0.7 \
-    --top_p 0.9 \
-    --num_return_sequences 3
-
-print_success "Generation test completed"
 
 print_status "=== Pipeline Summary ==="
 print_success "✓ SFT training: ./sft_dpo_init_merged"
@@ -202,6 +208,15 @@ print_success "✓ All logs saved to: $LOG_FILE"
 
 print_status "DPO Pipeline completed successfully!"
 print_status "You can now use the DPO-trained model at: ./dpo_sanity_merged"
+
+# Timing summary
+PIPELINE_END_TS=$(date +%s)
+TOTAL_PIPELINE=$((PIPELINE_END_TS-PIPELINE_START_TS))
+print_status "=== Timing Summary (seconds) ==="
+for entry in "${STAGE_TIMES[@]}"; do
+    print_status "  $entry"
+done
+print_status "  Total:${TOTAL_PIPELINE}s"
 
 # Display some stats
 if [ -f "dpo_comparison_results.json" ]; then

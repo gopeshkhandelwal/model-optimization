@@ -201,6 +201,7 @@ class ScriptArguments:
         default=False,
         metadata={"help": "Set True to force using an explicit reference model while also training PEFT adapters (passes force_use_ref_model=True to DPOTrainer)."},
     )
+    demo_fast: Optional[bool] = field(default=False, metadata={"help": "Enable ultra-fast demo mode (tiny data & steps)."})
 
 
 def parse_args():
@@ -228,6 +229,64 @@ def main():
         logger.info(f"ref_model_name_or_path not provided, using model path: {script_args.ref_model_name_or_path}")
     
     logger.info(f"ScriptArguments: {script_args}")
+
+    # ---------------------------
+    # Demo fast overrides
+    # ---------------------------
+    if script_args.demo_fast:
+        logger.warning("[DemoFast][DPO] Activating fast demo overrides: limiting data & steps for <20m pipeline.")
+        # Reduce steps if unset or large
+        if script_args.max_steps == -1 or script_args.max_steps > 40:
+            script_args.max_steps = 40
+            logger.info("[DemoFast][DPO] Setting max_steps=40")
+        # One epoch only
+        script_args.num_train_epochs = 1
+        # Cap train samples
+        if script_args.max_train_samples is None or (script_args.max_train_samples and script_args.max_train_samples > 100):
+            script_args.max_train_samples = 100
+            logger.info("[DemoFast][DPO] Setting max_train_samples=100")
+        # Disable eval fraction
+        script_args.eval_fraction = 0.0
+        script_args.max_eval_samples = 0
+        # Batch and accumulation
+        script_args.per_device_train_batch_size = min(script_args.per_device_train_batch_size, 2)
+        script_args.gradient_accumulation_steps = 1
+        # Sequence lengths
+        if script_args.max_length > 384:
+            script_args.max_length = 384
+            logger.info("[DemoFast][DPO] Reducing max_length=384")
+        if script_args.max_prompt_length > 192:
+            script_args.max_prompt_length = 192
+            logger.info("[DemoFast][DPO] Reducing max_prompt_length=192")
+        if script_args.max_target_length > 192:
+            script_args.max_target_length = 192
+            logger.info("[DemoFast][DPO] Reducing max_target_length=192")
+        # Warmup
+        if script_args.warmup_steps > 2:
+            script_args.warmup_steps = 2
+            logger.info("[DemoFast][DPO] Setting warmup_steps=2")
+        # Smaller LoRA rank
+        if script_args.use_peft and script_args.lora_r > 16:
+            script_args.lora_r = 16
+            logger.info("[DemoFast][DPO] Setting lora_r=16")
+        # Logging / eval / save steps
+        if script_args.logging_steps > 10:
+            script_args.logging_steps = 10
+            logger.info("[DemoFast][DPO] Setting logging_steps=10")
+        if script_args.save_steps > 999:
+            script_args.save_steps = 40
+            logger.info("[DemoFast][DPO] Setting save_steps=40")
+        if script_args.eval_steps > 999:
+            script_args.eval_steps = 40
+            logger.info("[DemoFast][DPO] Setting eval_steps=40 (will be ignored if eval disabled)")
+        # Turn off gradient checkpointing (overhead) if enabled
+        if script_args.gradient_checkpointing:
+            script_args.gradient_checkpointing = False
+            logger.info("[DemoFast][DPO] Disabling gradient_checkpointing for speed")
+        # Skip dataset verification expensive checks
+        if script_args.datasets_verification_mode != 'no_checks':
+            script_args.datasets_verification_mode = 'no_checks'
+            logger.info("[DemoFast][DPO] Setting datasets_verification_mode=no_checks")
     
     # Set seed
     set_seed(script_args.seed)

@@ -71,6 +71,12 @@ def generate_text(
 ) -> List[str]:
     """Generate text using the model"""
     
+    # Adjust incompatible settings: greedy (do_sample=False) cannot have num_return_sequences > 1
+    if not do_sample and num_return_sequences > 1:
+        logger.warning(
+            "Greedy decoding does not support num_return_sequences>1. Switching to sampling (do_sample=True)."
+        )
+        do_sample = True
     logger.info(f"Generating {num_return_sequences} sequence(s) for prompt: {prompt[:50]}...")
     
     # Tokenize input
@@ -79,9 +85,9 @@ def generate_text(
     # Generation parameters
     generation_kwargs = {
         "max_new_tokens": max_new_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "top_k": top_k,
+        "temperature": temperature if do_sample else 1.0,
+        "top_p": top_p if do_sample else 1.0,
+        "top_k": top_k if do_sample else 0,
         "do_sample": do_sample,
         "num_return_sequences": num_return_sequences,
         "pad_token_id": tokenizer.pad_token_id,
@@ -92,8 +98,25 @@ def generate_text(
     
     # Generate
     start_time = time.time()
-    with torch.no_grad():
-        outputs = model.generate(**inputs, **generation_kwargs)
+    try:
+        with torch.no_grad():
+            outputs = model.generate(**inputs, **generation_kwargs)
+    except RuntimeError as e:
+        if "probability tensor" in str(e):
+            logger.warning("Sampling failed due to invalid probabilities (NaN/inf). Falling back to greedy decoding.")
+            generation_kwargs_fallback = generation_kwargs.copy()
+            generation_kwargs_fallback.update({
+                "do_sample": False,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "num_return_sequences": 1,
+            })
+            with torch.no_grad():
+                outputs = model.generate(**inputs, **generation_kwargs_fallback)
+            num_return_sequences = 1
+        else:
+            raise
     generation_time = time.time() - start_time
     
     # Decode outputs
