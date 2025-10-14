@@ -1,0 +1,322 @@
+{
+  "metrics": {
+    "base_mean_margin": -97.40474796295166,
+    "post_mean_margin": NaN,
+    "delta": NaN,
+    "win_rate": 0.0,
+    "num_pairs": 16,
+    "training_loss": 0.0,
+    "training_time_seconds": 9.069552659988403,
+    "nan_base_count": 0,
+    "nan_post_count": 16
+  },
+  "generations": [
+    {
+      "prompt": "Explain gradient descent.",
+      "before": "",
+      "after": ""
+    },
+    {
+      "prompt": "What is overfitting?",
+      "before": "",
+      "after": ""
+    },
+    {
+      "prompt": "Benefit of LoRA?",
+      "before": "",
+      "after": ""
+    }
+  ],
+  "base_margins": [
+    {
+      "prompt": "Explain gradient descent. ",
+      "chosen": "Gradient descent iteratively updates parameters in the negative direction of the gradient to minimize a loss function.",
+      "rejected": "It changes parameters.",
+      "lp_chosen": -93.57926940917969,
+      "lp_rejected": -71.47267150878906,
+      "margin": -22.106597900390625,
+      "nan_flag": false
+    },
+    {
+      "prompt": "What is overfitting? ",
+      "chosen": "Overfitting happens when a model memorizes training data patterns including noise, reducing generalization to unseen data.",
+      "rejected": "Model memorizes.",
+      "lp_chosen": -167.42311096191406,
+      "lp_rejected": -75.907470703125,
+      "margin": -91.51564025878906,
+      "nan_flag": false
+    },
+    {
+      "prompt": "Benefit of LoRA? ",
+      "chosen": "LoRA reduces trainable parameter count by injecting low-rank adapters into weight matrices, enabling efficient fine-tuning.",
+      "rejected": "Uses small matrices.",
+      "lp_chosen": -222.57879638671875,
+      "lp_rejected": -63.69439697265625,
+      "margin": -158.8843994140625,
+      "nan_flag": false
+    },
+    {
+      "prompt": "Purpose of validation set? ",
+      "chosen": "A validation set provides an unbiased estimate of model performance during training enabling hyperparameter tuning without test leakage.",
+      "rejected": "To check performance.",
+      "lp_chosen": -143.04734802246094,
+      "lp_rejected": -39.84651184082031,
+      "margin": -103.20083618164062,
+      "nan_flag": false
+    },
+    {
+      "prompt": "What does temperature do in sampling? ",
+      "chosen": "Temperature scales logits; higher values increase entropy and diversity while lower values make outputs more deterministic.",
+      "rejected": "Changes randomness.",
+      "lp_chosen": -218.53109741210938,
+      "lp_rejected": -82.11544799804688,
+      "margin": -136.4156494140625,
+      "nan_flag": false
+    },
+    {
+      "prompt": "Explain gradient descent. ",
+      "chosen": "Gradient descent iteratively updates parameters in the negative direction of the gradient to minimize a loss function.",
+      "rejected": "It changes parameters.",
+      "lp_chosen": -93.57926940917969,
+      "lp_rejected": -71.47267150878906,
+      "margin": -22.106597900390625,
+      "nan_flag": false
+    },
+    {
+      "prompt": "What is overfitting? ",
+      "chosen": "Overfitting happens when a model memorizes training data patterns including noise, reducing generalization to unseen data.",
+      "rejected": "Model memorizes.",
+      "lp_chosen": -167.42311096191406,
+      "lp_rejected": -75.907470703125,
+      "margin": -91.51564025878906,
+      "nan_flag": false
+    },
+    {
+      "prompt": "Benefit of LoRA? ",
+      "chosen": "LoRA reduces trainable parameter count by injecting low-rank adapters into weight matrices, enabling efficient fine-tuning.",
+      "rejected": "Uses small matrices.",
+      "lp_chosen": -222.57879638671875,
+      "lp_rejected": -63.69439697265625,
+      "margin": -158.8843994140625,
+      "nan_flag": false
+    },
+    {
+      "prompt": "Purpose of validation set? ",
+      "chosen": "A validation set provides an unbiased estimate of model performance during training enabling hyperparameter tuning without test leakage.",
+      "rejected": "To check performance.",
+      "lp_chosen": -143.04734802246094,
+      "lp_rejected": -39.84651184082031,
+      "margin": -103.20083618164062,
+      "nan_flag": false
+    },
+    {
+      "prompt": "What does temperature do in sampling? ",
+      "chosen": "Temperature scales logits; higher values increase entropy and diversity while lower values make outputs more deterministic.",
+      "rejected": "Changes randomness.",
+      "lp_chosen": -218.53109741210938,
+      "lp_rejected": -82.11544799804688,
+      "margin": -136.4156494140625,
+      "nan_flag": false
+    },
+    {
+      "prompt": "Explain gradient descent. ",
+      "chosen": "Gradient descent iteratively updates parameters in the negative direction of the gradient to minimize a loss function.",
+      "rejected": "It changes parameters.",
+      "lp_chosen": -93.57926940917969,
+      "lp_rejected": -71.47267150878906,
+      "margin": -22.106597900390625,
+      "nan_flag": false
+    },
+    {
+      "prompt": "What is overfitting? ",
+      "chosen": "Overfitting happens when a model memorizes training data patterns including noise, reducing generalization to unseen data.",
+      "rejected": "Model memorizes.",
+      "lp_chosen": -167.42311096191406,
+      "lp_rejected": -75.907470703125,
+      "margin": -91.51564025878906,
+      "nan_flag": false
+    },
+    {
+      "prompt": "Benefit of LoRA? ",
+      "chosen": "LoRA reduces trainable parameter count by injecting low-rank adapters into weight matrices, enabling efficient fine-tuning.",
+      "rejected": "Uses small matrices.",
+      "lp_chosen": -222.57879638671875,
+      "lp_rejected": -63.69439697265625,
+      "margin": -158.8843994140625,
+      "nan_flag": false
+    },
+    {
+      "prompt": "Purpose of validation set? ",
+      "chosen": "A validation set provides an unbiased estimate of model performance during training enabling hyperparameter tuning without test leakage.",
+      "rejected": "To check performance.",
+      "lp_chosen": -143.04734802246094,
+      "lp_rejected": -39.84651184082031,
+      "margin": -103.20083618164062,
+      "nan_flag": false
+    },
+    {
+      "prompt": "What does temperature do in sampling? ",
+      "chosen": "Temperature scales logits; higher values increase entropy and diversity while lower values make outputs more deterministic.",
+      "rejected": "Changes randomness.",
+      "lp_chosen": -218.53109741210938,
+      "lp_rejected": -82.11544799804688,
+      "margin": -136.4156494140625,
+      "nan_flag": false
+    },
+    {
+      "prompt": "Explain gradient descent. ",
+      "chosen": "Gradient descent iteratively updates parameters in the negative direction of the gradient to minimize a loss function.",
+      "rejected": "It changes parameters.",
+      "lp_chosen": -93.57926940917969,
+      "lp_rejected": -71.47267150878906,
+      "margin": -22.106597900390625,
+      "nan_flag": false
+    }
+  ],
+  "post_margins": [
+    {
+      "prompt": "Explain gradient descent. ",
+      "chosen": "Gradient descent iteratively updates parameters in the negative direction of the gradient to minimize a loss function.",
+      "rejected": "It changes parameters.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "What is overfitting? ",
+      "chosen": "Overfitting happens when a model memorizes training data patterns including noise, reducing generalization to unseen data.",
+      "rejected": "Model memorizes.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "Benefit of LoRA? ",
+      "chosen": "LoRA reduces trainable parameter count by injecting low-rank adapters into weight matrices, enabling efficient fine-tuning.",
+      "rejected": "Uses small matrices.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "Purpose of validation set? ",
+      "chosen": "A validation set provides an unbiased estimate of model performance during training enabling hyperparameter tuning without test leakage.",
+      "rejected": "To check performance.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "What does temperature do in sampling? ",
+      "chosen": "Temperature scales logits; higher values increase entropy and diversity while lower values make outputs more deterministic.",
+      "rejected": "Changes randomness.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "Explain gradient descent. ",
+      "chosen": "Gradient descent iteratively updates parameters in the negative direction of the gradient to minimize a loss function.",
+      "rejected": "It changes parameters.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "What is overfitting? ",
+      "chosen": "Overfitting happens when a model memorizes training data patterns including noise, reducing generalization to unseen data.",
+      "rejected": "Model memorizes.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "Benefit of LoRA? ",
+      "chosen": "LoRA reduces trainable parameter count by injecting low-rank adapters into weight matrices, enabling efficient fine-tuning.",
+      "rejected": "Uses small matrices.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "Purpose of validation set? ",
+      "chosen": "A validation set provides an unbiased estimate of model performance during training enabling hyperparameter tuning without test leakage.",
+      "rejected": "To check performance.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "What does temperature do in sampling? ",
+      "chosen": "Temperature scales logits; higher values increase entropy and diversity while lower values make outputs more deterministic.",
+      "rejected": "Changes randomness.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "Explain gradient descent. ",
+      "chosen": "Gradient descent iteratively updates parameters in the negative direction of the gradient to minimize a loss function.",
+      "rejected": "It changes parameters.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "What is overfitting? ",
+      "chosen": "Overfitting happens when a model memorizes training data patterns including noise, reducing generalization to unseen data.",
+      "rejected": "Model memorizes.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "Benefit of LoRA? ",
+      "chosen": "LoRA reduces trainable parameter count by injecting low-rank adapters into weight matrices, enabling efficient fine-tuning.",
+      "rejected": "Uses small matrices.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "Purpose of validation set? ",
+      "chosen": "A validation set provides an unbiased estimate of model performance during training enabling hyperparameter tuning without test leakage.",
+      "rejected": "To check performance.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "What does temperature do in sampling? ",
+      "chosen": "Temperature scales logits; higher values increase entropy and diversity while lower values make outputs more deterministic.",
+      "rejected": "Changes randomness.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    },
+    {
+      "prompt": "Explain gradient descent. ",
+      "chosen": "Gradient descent iteratively updates parameters in the negative direction of the gradient to minimize a loss function.",
+      "rejected": "It changes parameters.",
+      "lp_chosen": -1000000000.0,
+      "lp_rejected": -1000000000.0,
+      "margin": 0.0,
+      "nan_flag": true
+    }
+  ]
+}
