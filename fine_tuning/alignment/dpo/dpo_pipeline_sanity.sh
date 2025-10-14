@@ -1,251 +1,158 @@
-#!/bin/bash
-# dpo_pipeline_sanity.sh
-# DPO (Direct Preference Optimization) Pipeline for Gaudi3
-
+#!/usr/bin/env bash
 set -euo pipefail
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+START_PIPELINE=$(date +%s)
 
-# Function to print colored output
-print_status() {
-    echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')] $1${NC}"
+# Fast DPO pipeline (override via env if desired)
+DPO_MAX_STEPS=${DPO_MAX_STEPS:-140}
+DPO_LOGGING_STEPS=${DPO_LOGGING_STEPS:-10}
+DPO_LORA_TARGET=${DPO_LORA_TARGET:-"q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"}
+
+# Base model (now mandatory: pass as first arg OR export MODEL_NAME)
+MODEL_NAME="${1:-${MODEL_NAME:-}}"
+if [ -z "${MODEL_NAME}" ]; then
+  echo "ERROR: Base model not specified. Provide as first argument or export MODEL_NAME."
+  echo "Usage: MODEL_NAME=google/gemma-3-270m ./dpo_pipeline_sanity.sh" >&2
+  echo "   or: ./dpo_pipeline_sanity.sh google/gemma-3-270m" >&2
+  exit 1
+fi
+echo "[CONFIG] MODEL_NAME=${MODEL_NAME}"
+declare -A STEP_START
+declare -A STEP_DURATION
+
+time_step_begin() {
+  local key="$1"; STEP_START[$key]=$(date +%s)
+  echo "[TIMER] BEGIN $key at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 }
 
-print_success() {
-    echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')] ✓ $1${NC}"
+time_step_end() {
+  local key="$1"; local end=$(date +%s); local dur=$(( end - STEP_START[$key] ))
+  STEP_DURATION[$key]=$dur
+  echo "[TIMER] END   $key at $(date -u '+%Y-%m-%dT%H:%M:%SZ') (duration=${dur}s)"
 }
 
-print_warning() {
-    echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] ⚠ $1${NC}"
+LOGFILE="dpo_pipeline_sanity.log"
+exec > >(tee -a "$LOGFILE") 2>&1
+
+banner() {
+  echo
+  echo "============================================================"
+  echo ">>> $1"
+  echo "============================================================"
 }
 
-print_error() {
-    echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ✗ $1${NC}"
-}
+# Base model (now mandatory: pass as first arg OR export MODEL_NAME)
+MODEL_NAME="${1:-${MODEL_NAME:-}}"
+if [ -z "${MODEL_NAME}" ]; then
+  echo "ERROR: Base model not specified. Provide as first argument or export MODEL_NAME."
+  echo "Usage: MODEL_NAME=google/gemma-3-270m ./ppo_pipeline_sanity.sh" >&2
+  echo "   or: ./ppo_pipeline_sanity.sh google/gemma-3-270m" >&2
+  exit 1
+fi
+echo "[CONFIG] MODEL_NAME=${MODEL_NAME}"
 
-# Set model name from environment variable or command line argument
-if [ $# -gt 0 ]; then
-    MODEL_NAME="$1"
-elif [ -n "${MODEL_NAME:-}" ]; then
-    MODEL_NAME="${MODEL_NAME}"
+# Common HPU env vars
+export PT_HPU_DISABLE_FUSED_ADAMW=1
+export PT_HPU_DISABLE_FUSED_ADAM=1
+export PT_HPU_ENABLE_REFINE_DYNAMIC_SHAPES=0
+
+if [ "${SKIP_SFT:-0}" = "1" ]; then
+  banner "STEP 1: Supervised Fine-Tuning SKIPPED (using base model directly)"
+  # Create a symlink named sft_sanity_merged pointing to the base model directory (if local) or just reuse MODEL_NAME if remote
+  if [ -d "${MODEL_NAME}" ]; then
+    ln -sfn "${MODEL_NAME}" ./sft_sanity_merged
+  else
+    # Remote model: create marker directory referencing base
+    mkdir -p ./sft_sanity_merged
+    echo "REMOTE_MODEL=${MODEL_NAME}" > ./sft_sanity_merged/BASE_MODEL_REFERENCE
+  fi
 else
-    print_error "MODEL_NAME is required. Set it as environment variable or pass as first argument."
-    print_error "Usage: MODEL_NAME=google/gemma-3-270m $0"
-    print_error "   or: $0 google/gemma-3-270m"
-    exit 1
-fi
-
-FAST_MODE=${FAST_MODE:-0}
-for arg in "$@"; do
-    if [[ "$arg" == "--fast" || "$arg" == "--demo_fast" ]]; then FAST_MODE=1; fi
-done
-print_status "Starting DPO Pipeline with MODEL_NAME=${MODEL_NAME} FAST_MODE=${FAST_MODE}"
-PIPELINE_START_TS=$(date +%s)
-STAGE_TIMES=()
-
-# Log file
-LOG_FILE="dpo_pipeline_sanity.log"
-exec > >(tee -a "$LOG_FILE") 2>&1
-
-print_status "Logging to: $LOG_FILE"
-print_status "Model: $MODEL_NAME"
-
-# Check if we're in the right directory
-if [ ! -f "dpo.py" ]; then
-    print_error "dpo.py not found. Please run this script from the alignment/dpo directory."
-    exit 1
-fi
-
-# Verify HPU environment
-if ! command -v hl-smi &> /dev/null; then
-    print_warning "hl-smi not found. HPU environment may not be properly set up."
-fi
-
-print_status "=== Step 1: Supervised Fine-Tuning (SFT) ==="
-print_status "Training base model with supervised data for DPO initialization"
-SFT_START=$(date +%s)
-
-PT_HPU_LAZY_MODE=1 python sft.py \
+  banner "STEP 1: Supervised Fine-Tuning (Ultra-Fast)"
+  time_step_begin SFT
+  python sft.py \
     --model_name_or_path "${MODEL_NAME}" \
-    --dataset_name="Anthropic/hh-rlhf" \
-    --dataset_config="default" \
-    --split="test" \
-    --max_seq_length=512 \
-    --per_device_train_batch_size=2 \
-    --gradient_accumulation_steps=4 \
-    --learning_rate=1e-4 \
-    --logging_steps=5 \
-    --num_train_epochs=1 \
-    --max_steps=100 \
-    --output_dir=./sft_dpo_init \
-    --save_strategy="epoch" \
-    --optim="adamw_torch" \
-    --warmup_steps=10 \
-    --bf16=True \
-    --remove_unused_columns=False \
-    --max_train_samples=500 \
-    $( [[ "$FAST_MODE" == "1" ]] && echo "--demo_fast" )
-
-print_success "SFT training completed"
-SFT_END=$(date +%s); STAGE_TIMES+=("SFT:$((SFT_END-SFT_START))s")
-
-# Merge PEFT adapter
-print_status "=== Step 1b: Merging PEFT Adapter ==="
-MERGE_SFT_START=$(date +%s)
-python merge_peft_adapter.py \
-    --adapter_model_name=./sft_dpo_init \
-    --base_model_name="${MODEL_NAME}" \
-    --output_name=./sft_dpo_init_merged
-
-print_success "PEFT adapter merged"
-MERGE_SFT_END=$(date +%s); STAGE_TIMES+=("MergeSFT:$((MERGE_SFT_END-MERGE_SFT_START))s")
-
-print_status "=== Step 2: DPO Training ==="
-print_status "Training with preference data using Direct Preference Optimization"
-DPO_START=$(date +%s)
-
-# Auto-detect available splits for the preference dataset to avoid ExpectedMoreSplits errors
-print_status "Detecting available splits for lvwerra/stack-exchange-paired"
-AVAILABLE_SPLITS=$(python - <<'PY'
-from datasets import load_dataset
-try:
-    ds_dict = load_dataset("lvwerra/stack-exchange-paired")
-    print(" ".join(ds_dict.keys()))
-except Exception as e:
-    print(f"ERROR:{e}")
-PY
-)
-if [[ "$AVAILABLE_SPLITS" == ERROR:* ]]; then
-    print_warning "Could not enumerate dataset splits ($AVAILABLE_SPLITS). Proceeding with fallback logic in dpo.py"
-    PREF_SPLIT="train"
-else
-    print_status "Available splits: $AVAILABLE_SPLITS"
-    PREF_SPLIT="train"
-    for cand in train training train_full train_augmented; do
-        if echo "$AVAILABLE_SPLITS" | grep -qw "$cand"; then PREF_SPLIT="$cand"; break; fi
-    done
-    if [[ "$PREF_SPLIT" == "train" ]]; then
-        # If no explicit train-like split, choose test or first
-        if echo "$AVAILABLE_SPLITS" | grep -qw test; then
-            PREF_SPLIT="test"
-        else
-            PREF_SPLIT=$(echo "$AVAILABLE_SPLITS" | awk '{print $1}')
-        fi
-    fi
+    --dataset_name openbmb/UltraFeedback \
+    --subset None \
+    --streaming False \
+    --size_valid_set 200 \
+    --output_dir ./sft_sanity \
+    --do_train \
+    --max_steps 20 \
+    --logging_steps 5 \
+    --save_steps 999999 \
+    --per_device_train_batch_size 2 \
+    --gradient_accumulation_steps 1 \
+    --learning_rate 3e-5 \
+    --lr_scheduler_type cosine \
+    --warmup_steps 2 \
+    --weight_decay 0.01 \
+  --lora_target_modules "q_proj" "k_proj" "v_proj" "o_proj" "gate_proj" "up_proj" "down_proj" \
+    --bf16 \
+    --remove_unused_columns False \
+    --report_to none \
+    --use_habana \
+    --use_lazy_mode \
+    --demo_fast \
+    --merge_adapter_after_train \
+    --merged_output_dir ./sft_sanity_merged
+  time_step_end SFT
 fi
-print_status "Using preference training split: $PREF_SPLIT"
 
+banner "STEP 2: DPO Training"
+time_step_begin DPO
 PT_HPU_LAZY_MODE=1 python dpo.py \
-    --model_name_or_path ./sft_dpo_init_merged \
-    --tokenizer_name_or_path "${MODEL_NAME}" \
-    --dataset_name="lvwerra/stack-exchange-paired" \
-    --split="${PREF_SPLIT}" \
-    --per_device_train_batch_size=1 \
-    --per_device_eval_batch_size=1 \
-    --gradient_accumulation_steps=4 \
-    --learning_rate=5e-4 \
-    --lr_scheduler_type="cosine" \
-    --warmup_steps=50 \
-    --max_length=512 \
-    --max_prompt_length=256 \
-    --max_target_length=256 \
-    --beta=0.1 \
-    --num_train_epochs=1 \
-    --max_steps=100 \
-    --logging_steps=10 \
-    --save_steps=50 \
-    --eval_steps=50 \
-    --eval_fraction=0.02 \
-    --datasets_verification_mode=no_checks \
-    --output_dir=./dpo_sanity \
-    --gradient_checkpointing=True \
-    --use_peft=True \
-    --lora_r=64 \
-    --lora_alpha=16 \
-    --max_train_samples=200 \
-    $( [[ "$FAST_MODE" == "1" ]] && echo "--demo_fast" )
+  --model_name_or_path ./sft_sanity_merged \
+  --tokenizer_name_or_path "${MODEL_NAME}" \
+  --output_dir ./dpo_sanity \
+  --beta 0.05 \
+  --max_steps ${DPO_MAX_STEPS} \
+  --learning_rate 2e-5 \
+  --warmup_steps 10 \
+  --per_device_train_batch_size 2 \
+  --per_device_eval_batch_size 2 \
+  --gradient_accumulation_steps 1 \
+  --logging_steps ${DPO_LOGGING_STEPS} \
+  --save_steps 999999 \
+  --eval_steps 999999 \
+  --lora_target_modules ${DPO_LORA_TARGET} \
+  --report_to none \
+  --seed 42 \
+  --merge_adapter_after_train True \
+  --merged_output_dir ./dpo_sanity_merged
+time_step_end DPO
 
-print_success "DPO training completed"
-DPO_END=$(date +%s); STAGE_TIMES+=("DPO:$((DPO_END-DPO_START))s")
-
-# Merge DPO PEFT adapter
-print_status "=== Step 2b: Merging DPO PEFT Adapter ==="
-MERGE_DPO_START=$(date +%s)
-python merge_peft_adapter.py \
-    --adapter_model_name=./dpo_sanity \
-    --base_model_name=./sft_dpo_init_merged \
-    --output_name=./dpo_sanity_merged
-
-print_success "DPO PEFT adapter merged"
-MERGE_DPO_END=$(date +%s); STAGE_TIMES+=("MergeDPO:$((MERGE_DPO_END-MERGE_DPO_START))s")
-
-print_status "=== Step 3: Model Comparison ==="
-print_status "Comparing base model vs DPO-trained model"
-COMPARE_START=$(date +%s)
-
+banner "STEP 3: Comparing Base and DPO Models"
+time_step_begin COMPARE
 PT_HPU_LAZY_MODE=1 python compare_base_vs_dpo.py \
-    --base_model "${MODEL_NAME}" \
-    --finetuned_model ./dpo_sanity_merged \
-    --seed 123 \
-    --greedy \
-    --output_json dpo_comparison_results.json \
-    $( [[ "$FAST_MODE" == "1" ]] && echo "--demo_fast" )
+  --base_model "${MODEL_NAME}" \
+  --finetuned_model $( [ -d ./dpo_sanity_merged ] && echo ./dpo_sanity_merged || echo ./dpo_sanity ) \
+  --seed 123 \
+  --max_new_tokens 160 \
+  --min_new_tokens 80 \
+  --temperature 0.85 \
+  --repetition_penalty 1.15 \
+  --stackexchange_style \
+  --heuristics \
+  --show_text
+time_step_end COMPARE
 
-print_success "Model comparison completed"
-COMPARE_END=$(date +%s); STAGE_TIMES+=("Compare:$((COMPARE_END-COMPARE_START))s")
+PIPELINE_END=$(date +%s)
+TOTAL_DUR=$(( PIPELINE_END - START_PIPELINE ))
 
-
-print_status "=== Pipeline Summary ==="
-print_success "✓ SFT training: ./sft_dpo_init_merged"
-print_success "✓ DPO training: ./dpo_sanity_merged"  
-print_success "✓ Comparison results: dpo_comparison_results.json"
-print_success "✓ All logs saved to: $LOG_FILE"
-
-print_status "DPO Pipeline completed successfully!"
-print_status "You can now use the DPO-trained model at: ./dpo_sanity_merged"
-
-# Timing summary
-PIPELINE_END_TS=$(date +%s)
-TOTAL_PIPELINE=$((PIPELINE_END_TS-PIPELINE_START_TS))
-print_status "=== Timing Summary (seconds) ==="
-for entry in "${STAGE_TIMES[@]}"; do
-    print_status "  $entry"
+echo
+echo "=================== PIPELINE TIMING SUMMARY ==================="
+printf "%-20s %10s\n" "Stage" "Seconds"
+printf "%-20s %10s\n" "-----" "-------"
+for k in SFT DPO COMPARE; do
+  printf "%-20s %10s\n" "$k" "${STEP_DURATION[$k]:-n/a}"
 done
-print_status "  Total:${TOTAL_PIPELINE}s"
+printf "%-20s %10s\n" "TOTAL" "$TOTAL_DUR"
+echo "==============================================================="
 
-# Display some stats
-if [ -f "dpo_comparison_results.json" ]; then
-    print_status "=== Quick Results Preview ==="
-    python3 -c "
-import json
-try:
-    with open('dpo_comparison_results.json', 'r') as f:
-        data = json.load(f)
-    comparisons = data.get('comparisons', [])
-    if comparisons:
-        print(f'Compared {len(comparisons)} prompts')
-        total_time = data.get('total_duration_sec', 0)
-        print(f'Total comparison time: {total_time:.2f}s')
-        
-        # Show first comparison as example
-        if len(comparisons) > 0:
-            first = comparisons[0]
-            prompt = first['prompt'][:60] + '...' if len(first['prompt']) > 60 else first['prompt']
-            print(f'Example prompt: {prompt}')
-            
-            base_resp = first['results']['Base']['response'][:80] + '...' if len(first['results']['Base']['response']) > 80 else first['results']['Base']['response']
-            dpo_resp = first['results']['DPO']['response'][:80] + '...' if len(first['results']['DPO']['response']) > 80 else first['results']['DPO']['response']
-            
-            print(f'Base response: {base_resp}')
-            print(f'DPO response:  {dpo_resp}')
-except Exception as e:
-    print(f'Could not parse results: {e}')
-"
-fi
+echo
+echo "=================== ARTIFACT SUMMARY ==================="
+if [ -d ./sft_sanity_merged ]; then echo "SFT merged policy: ./sft_sanity_merged"; fi
+if [ -d ./dpo_sanity ]; then echo "DPO adapter policy: ./dpo_sanity"; fi
+echo "========================================================"
 
-print_success "DPO pipeline execution completed! 🎉"
+banner "✅ DPO PIPELINE COMPLETED SUCCESSFULLY (WITH COMPARISON)"

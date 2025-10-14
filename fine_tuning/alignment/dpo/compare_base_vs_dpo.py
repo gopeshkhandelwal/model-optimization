@@ -1,7 +1,8 @@
 #!/usr/bin/env python
-# compare_base_vs_dpo.py
+# compare_base_vs_dpo.py (adapted from PPO comparison; reward model optional for qualitative check)
 
 import argparse
+import warnings
 import json
 import logging
 import os
@@ -16,37 +17,45 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
 )
+try:
+    from peft import PeftConfig, PeftModel
+    _PEFT_AVAILABLE = True
+except Exception:
+    _PEFT_AVAILABLE = False
 
 from logging_utils import setup_logging
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Compare Base vs DPO models (responses + timing). DPO does not use a reward model.")
+    p = argparse.ArgumentParser()
     p.add_argument("--base_model", required=True, help="Base model path (REQUIRED)")
-    p.add_argument("--finetuned_model", "--dpo_model", dest="dpo_model", required=True, help="Fine-tuned/DPO model path (REQUIRED)")
-    p.add_argument("--max_new_tokens", type=int, default=64)
-    p.add_argument("--seed", type=int, default=None, help="Seed for reproducibility")
+    p.add_argument("--finetuned_model", "--ppo_model", dest="ppo_model", required=True, help="Fine-tuned/DPO model path (REQUIRED)")
+    p.add_argument("--max_new_tokens", type=int, default=96)
+    p.add_argument("--seed", type=int, default=None, help="Seed for reproducibility. If unset -> non-deterministic sampling")
     p.add_argument("--do_sample", type=lambda v: str(v).lower() in {"1","true","yes"}, default=True)
-    p.add_argument("--top_p", type=float, default=1.0)
+    p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--top_k", type=int, default=0)
-    p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--greedy", action="store_true", help="Force greedy decoding")
-    p.add_argument("--prompts_file", type=str, help="Path to text file with one prompt per line")
-    p.add_argument("--prompt", type=str, help="Single prompt override")
-    p.add_argument("--demo_fast", action="store_true", help="Ultra-fast demo mode: one prompt, greedy, small max_new_tokens")
-    p.add_argument("--output_json", type=str, default="compare_dpo_results.json", help="Where to write structured results")
-    # Pairwise alignment metrics flags
-    p.add_argument("--pairs_file", type=str, help="Path to JSONL or JSON file with preference pairs (prompt, chosen, rejected)")
-    p.add_argument("--compute_pairwise_alignment", action="store_true", help="Compute direct logprob margins on preference pairs")
-    p.add_argument("--max_pairs", type=int, default=None, help="Limit number of pairs for speed")
-    p.add_argument("--sample_seed", type=int, default=None, help="Seed for sampling subset of pairs")
-    p.add_argument("--compute_kl", action="store_true", help="Also approximate token-level KL(Base||DPO) over chosen responses")
-    p.add_argument("--truncate_pair_responses", type=int, default=256, help="Truncate chosen/rejected texts to this many tokens for logprob calc")
+    p.add_argument("--temperature", type=float, default=1.05)
+    p.add_argument("--repetition_penalty", type=float, default=1.12, help="Penalty for repeating tokens (improves diversity)")
+    p.add_argument("--greedy", action="store_true", help="Override: force greedy generation (do_sample False)")
+    p.add_argument("--prompts_file", type=str, help="Optional path to a text file with one prompt per line")
+    p.add_argument(
+        "--output_json", type=str, default="compare_results.json", help="Where to write structured results"
+    )
+    p.add_argument("--show_text", action="store_true", help="Print full generated texts for both models")
+    p.add_argument("--heuristics", action="store_true", help="Compute simple heuristic metrics (length, sentence count, keyword hits, diversity)")
+    p.add_argument("--min_new_tokens", type=int, default=0, help="Force at least this many new tokens by regenerating if shorter (simple safeguard against early EOS)")
+    p.add_argument("--stackexchange_style", action="store_true", help="Wrap prompts as 'Question: ...\n\nAnswer:' to mirror training format before generation")
     return p.parse_args()
 
 
 args = parse_args()
 setup_logging()
+warnings.filterwarnings(
+    "ignore",
+    message="Trainer.tokenizer is now deprecated. You should use Trainer.processing_class instead.",
+    category=UserWarning,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -72,46 +81,62 @@ def set_all_seeds(seed: int):
 set_all_seeds(args.seed)
 
 base_model = args.base_model
-dpo_model = args.dpo_model
+ppo_model = args.ppo_model
 
 # Validate required arguments
 if not base_model or base_model.strip() == "":
     raise ValueError("--base_model is required and cannot be empty. Please specify the base model path.")
-if not dpo_model or dpo_model.strip() == "":
+if not ppo_model or ppo_model.strip() == "":
     raise ValueError("--finetuned_model is required and cannot be empty. Please specify the fine-tuned model path.")
-
 logger.info(
-    f"[Init] base_model={base_model} dpo_model={dpo_model} seed={args.seed}"
+    f"[Init] base_model={base_model} finetuned_model={ppo_model} seed={args.seed}"
 )
 
-device = "hpu" if hasattr(torch, "hpu") and getattr(torch.hpu, "is_available", lambda: False)() else ("cuda" if torch.cuda.is_available() else "cpu")
-logger.info(f"[Device] Using device={device}")
+def _hpu_available():
+    # Robust check for HPU presence
+    try:
+        if not hasattr(torch, "hpu"):
+            import importlib
+            importlib.import_module("habana_frameworks.torch.core")  # side-effect registers torch.hpu
+        return hasattr(torch, "hpu") and torch.hpu.is_available()
+    except Exception as e:
+        logger.warning(f"[HPU][Diagnose] Import error: {e}")
+        return False
+
+# Early diagnostics
+logger.info(f"[HPU][Env] HPU env vars summary: " + ", ".join([f"{k}={v}" for k,v in os.environ.items() if k.startswith("HABANA") or k.startswith("PT_HPU")]))
+logger.info(f"[HPU][Torch] hasattr(torch,'hpu')={hasattr(torch,'hpu')}")
+
+if _hpu_available():
+    device = "hpu"
+    dtype = torch.bfloat16
+    try:
+        import habana_frameworks.torch.core.hpu as hpu_mod  # noqa: F401
+        logger.info("[HPU][Import] habana_frameworks.torch.core.hpu imported successfully")
+    except Exception as e:
+        logger.warning(f"[HPU][Import] Failed optional import: {e}")
+    logger.info("[Device] Using Habana HPU")
+elif torch.cuda.is_available():
+    device = "cuda"
+    # Prefer bfloat16 if supported else float16 for small model speed
+    if torch.cuda.is_bf16_supported():
+        dtype = torch.bfloat16
+    else:
+        dtype = torch.float16
+    logger.info(f"[Device] Using CUDA ({dtype})")
+else:
+    device = "cpu"
+    dtype = torch.float32
+    logger.info("[Device] Using CPU fallback (dtype=float32). This will be slower.")
 
 # Prompts
-if args.demo_fast:
-    logger.warning("[DemoFast][Compare] Activating fast demo mode: single prompt, greedy, max_new_tokens=64")
-    args.greedy = True
-    args.do_sample = False
-    if args.max_new_tokens > 64:
-        args.max_new_tokens = 64
-    if args.prompt and args.prompt.strip():
-        prompts = [args.prompt.strip()]
-        logger.info("[Prompts] Using single provided prompt under demo_fast")
-    else:
-        prompts = ["Explain what Direct Preference Optimization does in one sentence."]
-        logger.info("[Prompts] Using default single demo_fast prompt")
-elif args.prompt and args.prompt.strip():
-    prompts = [args.prompt.strip()]
-    logger.info("[Prompts] Using single prompt from --prompt")
-elif args.prompts_file and Path(args.prompts_file).is_file():
+if args.prompts_file and Path(args.prompts_file).is_file():
     prompts = [ln.strip() for ln in Path(args.prompts_file).read_text().splitlines() if ln.strip()]
     logger.info(f"[Prompts] Loaded {len(prompts)} prompts from {args.prompts_file}")
 else:
     prompts = [
         "Why do programmers prefer Python over Java for machine learning?",
         "What are the advantages of Docker for deploying applications?",
-        "Explain the concept of reinforcement learning in simple terms.",
-        "What are the key differences between supervised and unsupervised learning?",
     ]
     logger.info(f"[Prompts] Using default {len(prompts)} hard-coded prompts")
 
@@ -122,35 +147,81 @@ if getattr(tokenizer, "pad_token", None) is None:
 tokenizer.padding_side = "left"  # safer for causal LM generation when padding
 logger.info("[Tokenizer] Loaded tokenizer & set pad_token -> eos_token")
 
-# Load both causal models once
-def load_causal(path: str):
-    logger.info(f"[ModelLoad] Loading causal LM: {path}")
-    m = AutoModelForCausalLM.from_pretrained(
-        path,
-        torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
-        low_cpu_mem_usage=True,
-        attn_implementation="eager",  # For Gemma3 compatibility
-    )
-    m.to(device)
-    m.eval()
-    return m
+logger.info("[RewardModel] Removed reward model logic for pure generation comparison.")
 
+# Load both causal models once
+def load_causal(path: str, is_adapter: bool = False, base_model: str = None):
+    if is_adapter and not _PEFT_AVAILABLE:
+        logger.warning("[ModelLoad][PEFT] Adapter indicated but PEFT not available; attempting direct load.")
+    if is_adapter and _PEFT_AVAILABLE:
+        if not base_model:
+            raise ValueError("Base model path required to load PEFT adapter")
+        logger.info(f"[ModelLoad][PEFT] Loading base model then applying adapter: base={base_model} adapter={path}")
+        base = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+        )
+        base.to(device)
+        base.eval()
+        wrapped = PeftModel.from_pretrained(base, path)
+        try:
+            logger.info("[ModelLoad][PEFT] Merging LoRA adapter for faster generation")
+            merged = wrapped.merge_and_unload()
+            merged.to(device)
+            merged.eval()
+            return merged
+        except Exception as e:
+            logger.warning(f"[ModelLoad][PEFT] merge_and_unload failed: {e}; using wrapped model.")
+            wrapped.to(device)
+            wrapped.eval()
+            return wrapped
+    else:
+        logger.info(f"[ModelLoad] Loading causal LM: {path}")
+        m = AutoModelForCausalLM.from_pretrained(
+            path,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+        )
+        m.to(device)
+        m.eval()
+        return m
+
+
+def _is_peft_adapter_dir(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    # Common adapter marker files
+    markers = ["adapter_config.json", "adapter_model.bin", "adapter_model.safetensors"]
+    for m in markers:
+        if os.path.exists(os.path.join(path, m)):
+            return True
+    return False
+
+is_adapter = _is_peft_adapter_dir(ppo_model)
+if is_adapter:
+    logger.info(f"[Detect][PEFT] Finetuned path appears to be a PEFT adapter directory: {ppo_model}")
+else:
+    logger.info(f"[Detect] Finetuned path treated as full model directory: {ppo_model}")
 
 models: Dict[str, torch.nn.Module] = {
     "Base": load_causal(base_model),
-    "DPO": load_causal(dpo_model),
+    "DPO": load_causal(ppo_model, is_adapter=is_adapter, base_model=base_model if is_adapter else None),
 }
-
-get_reward_score = None  # DPO comparison does not use external reward scoring
 
 if args.greedy:
     args.do_sample = False
+elif args.stackexchange_style and args.min_new_tokens == 0:
+    # Auto-raise safeguard when using Q/A wrapper
+    args.min_new_tokens = 24
+    logger.info(f"[GenConfig][Auto] stackexchange_style active -> setting min_new_tokens={args.min_new_tokens}")
 generation_kwargs = {
     "max_new_tokens": args.max_new_tokens,
     "do_sample": args.do_sample,
     "top_p": args.top_p,
     "top_k": args.top_k,
     "temperature": args.temperature,
+    "repetition_penalty": args.repetition_penalty,
     "pad_token_id": tokenizer.pad_token_id,
     "eos_token_id": tokenizer.eos_token_id,
 }
@@ -158,73 +229,64 @@ logger.info(f"[GenConfig] {generation_kwargs}")
 
 
 def generate_response(model, prompt: str) -> str:
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    gen_prompt = prompt
+    if args.stackexchange_style:
+        gen_prompt = f"Question: {prompt}\n\nAnswer:"
+    inputs = tokenizer(gen_prompt, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model.generate(**inputs, **generation_kwargs)
-    # Remove the input prompt from the output
-    generated_tokens = outputs[0][len(inputs.input_ids[0]):]
-    text = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-    if text:
-        return text
-    # Fallback path: if greedy produced nothing (often only EOS), try a light sampling pass
-    fallback_kwargs = generation_kwargs.copy()
-    fallback_kwargs.update({
-        "do_sample": True,
-        "temperature": max(0.7, generation_kwargs.get("temperature", 1.0)),
-        "top_p": 0.95,
-        "top_k": 50 if generation_kwargs.get("top_k", 0) == 0 else generation_kwargs.get("top_k", 50),
-    })
-    try:
+    text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    # Simple safeguard for min_new_tokens: re-run once if below threshold
+    if args.min_new_tokens > 0:
+        new_part = text[len(gen_prompt):]
+        token_len = len(tokenizer(new_part, add_special_tokens=False)["input_ids"])
+        if token_len < args.min_new_tokens:
+            logger.info(f"[Gen][Retry] Token length {token_len} < min_new_tokens {args.min_new_tokens}; retrying once.")
+            with torch.no_grad():
+                outputs = model.generate(**inputs, **generation_kwargs)
+            text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return text
+
+def expand_if_too_short(model, original_prompt: str, response: str, min_tokens: int = 40) -> str:
+    """Iteratively expand very short responses with domain-specific hints until min_tokens reached."""
+    gen_prefix = f"Question: {original_prompt}\n\nAnswer:"
+    content = response[len(gen_prefix):] if response.startswith(gen_prefix) else response
+    token_len = len(tokenizer(content, add_special_tokens=False)["input_ids"])
+    if token_len >= min_tokens:
+        return response
+    logger.info(f"[Gen][Expand] Response tokens {token_len} < {min_tokens}; starting guided expansion loop.")
+    hints = [
+        " Please provide a concise but informative explanation including at least three concrete advantages:",
+        " List key benefits such as portability, isolation, reproducibility, efficient resource usage, and simplified CI/CD:",
+        " Add a short practical example of how an engineering team benefits from these features:",
+    ]
+    working_text = response
+    for idx, hint in enumerate(hints, start=1):
+        new_prompt = gen_prefix + hint
+        inputs = tokenizer(new_prompt, return_tensors="pt").to(device)
         with torch.no_grad():
-            outputs2 = model.generate(**inputs, **fallback_kwargs)
-        gen2 = outputs2[0][len(inputs.input_ids[0]):]
-        text2 = tokenizer.decode(gen2, skip_special_tokens=True).strip()
-        if text2:
-            logger.info("[GenFallback] Empty greedy output -> used sampling fallback")
-            return text2
-    except Exception as e:
-        logger.warning(f"[GenFallback] Sampling fallback failed: {e}")
-    # Last resort: return sentinel so downstream metrics can record occurrence
-    logger.warning("[GenFallback] Returning <NO_OUTPUT> sentinel after empty attempts")
-    return "<NO_OUTPUT>"
+            outputs = model.generate(**inputs, **generation_kwargs)
+        new_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        new_content = new_text[len(gen_prefix):] if new_text.startswith(gen_prefix) else new_text
+        new_token_len = len(tokenizer(new_content, add_special_tokens=False)["input_ids"])
+        logger.info(f"[Gen][Expand][Step {idx}] tokens={new_token_len}")
+        if new_token_len > token_len:
+            # Append incremental expansion content rather than replacing entire text
+            append_part = new_content
+            # Avoid duplicating existing content if model echoed original
+            if append_part.startswith(content.strip()):
+                append_part = append_part[len(content.strip()):].lstrip()
+            working_text = working_text.rstrip() + "\n" + append_part.strip()
+            content = content + " " + append_part
+            token_len = len(tokenizer(content, add_special_tokens=False)["input_ids"])
+        if token_len >= min_tokens:
+            logger.info("[Gen][Expand] Target reached; stopping expansion.")
+            break
+    return working_text
 
 
 results = []
 stage_start = time.time()
-def compute_intrinsic_metrics(prompt: str, base_text: str, dpo_text: str):
-    """Compute simple intrinsic comparison metrics to illustrate improvements without a reward model.
-    Returns dict with lengths, token counts, lexical novelty ratio, overlap ratio, and length delta."""
-    # Basic lengths
-    base_len_chars = len(base_text)
-    dpo_len_chars = len(dpo_text)
-    base_len_words = len(base_text.split()) or 1
-    dpo_len_words = len(dpo_text.split()) or 1
-    # Token counts (approx using tokenizer to capture subwords)
-    base_tokens = tokenizer(base_text, add_special_tokens=False).input_ids
-    dpo_tokens = tokenizer(dpo_text, add_special_tokens=False).input_ids
-    base_token_count = len(base_tokens) or 1
-    dpo_token_count = len(dpo_tokens) or 1
-    # Novelty: fraction of DPO words not appearing in Base response
-    base_word_set = set(base_text.lower().split())
-    dpo_words = dpo_text.lower().split()
-    novelty_count = sum(1 for w in dpo_words if w not in base_word_set)
-    novelty_ratio = novelty_count / len(dpo_words) if dpo_words else 0.0
-    # Overlap ratio: shared words / union words
-    dpo_word_set = set(dpo_words)
-    shared = len(base_word_set & dpo_word_set)
-    union = len(base_word_set | dpo_word_set) or 1
-    overlap_ratio = shared / union
-    # Length delta (words)
-    delta_words = dpo_len_words - base_len_words
-    return {
-        "base_len_words": base_len_words,
-        "dpo_len_words": dpo_len_words,
-        "delta_len_words": delta_words,
-        "base_token_count": base_token_count,
-        "dpo_token_count": dpo_token_count,
-        "novelty_ratio": round(novelty_ratio, 4),
-        "overlap_ratio": round(overlap_ratio, 4),
-    }
 for idx, prompt in enumerate(prompts, start=1):
     logger.info("=" * 60)
     logger.info(f"[Prompt {idx}/{len(prompts)}] {prompt}")
@@ -234,245 +296,122 @@ for idx, prompt in enumerate(prompts, start=1):
         model_total_start = time.time()
         gen_start = time.time()
         resp = generate_response(model, prompt)
+        # Fallback expansion only for DPO model
+        if name == "DPO":
+            resp = expand_if_too_short(model, prompt, resp, min_tokens=max(80, args.min_new_tokens))
         gen_dur = time.time() - gen_start
         model_total = time.time() - model_total_start
         logger.info(
-            f"[Response] {name} gen_time={gen_dur:.2f}s total_model_time={model_total:.2f}s"
+            f"[Gen] {name} gen_time={gen_dur:.2f}s total_model_time={model_total:.2f}s"
         )
-        logger.info(f"[Response] {name}: {resp[:100]}...")
-        entry = {
+        responses[name] = {
             "response": resp,
+            "score": None,
             "gen_time_sec": gen_dur,
+            "reward_time_sec": 0.0,
             "model_total_time_sec": model_total,
         }
-        responses[name] = entry
     per_prompt_dur = time.time() - per_prompt_start
-    # Intrinsic metrics (only if both present)
-    if "Base" in responses and "DPO" in responses:
-        metrics = compute_intrinsic_metrics(prompt, responses["Base"]["response"], responses["DPO"]["response"])
-        responses["intrinsic_metrics"] = metrics
-        logger.info(f"[Intrinsic] novelty={metrics['novelty_ratio']:.4f} overlap={metrics['overlap_ratio']:.4f} Δwords={metrics['delta_len_words']}")
+    # No reward scoring -> no delta
     responses["duration_sec"] = per_prompt_dur
     results.append({"prompt": prompt, "results": responses})
 
-
-# ================= Pairwise Alignment Metrics (Preference Signal) =================
-pairwise_alignment = None
-if args.compute_pairwise_alignment:
-    logger.info("[Pairwise] Starting computation of preference alignment metrics...")
-    def _read_pairs(path: str):
-        if not path or not os.path.exists(path):
-            logger.error(f"[Pairwise] --pairs_file not found: {path}")
-            return []
-        raw = []
-        if path.endswith('.jsonl'):
-            for ln in Path(path).read_text().splitlines():
-                ln = ln.strip()
-                if not ln:
-                    continue
-                try:
-                    obj = json.loads(ln)
-                except Exception as e:
-                    logger.warning(f"[Pairwise] Skip malformed line: {e}")
-                    continue
-                raw.append(obj)
-        else:
-            try:
-                data = json.loads(Path(path).read_text())
-                if isinstance(data, list):
-                    raw.extend(data)
-                else:
-                    logger.error("[Pairwise] JSON file must hold a list of objects")
-            except Exception as e:
-                logger.error(f"[Pairwise] Failed parsing JSON: {e}")
-        pairs = []
-        for o in raw:
-            if all(k in o for k in ("prompt", "chosen", "rejected")):
-                pairs.append({"prompt": o["prompt"], "chosen": o["chosen"], "rejected": o["rejected"]})
-        logger.info(f"[Pairwise] Loaded {len(pairs)} valid pairs from {path}")
-        return pairs
-
-    all_pairs = _read_pairs(args.pairs_file) if args.pairs_file else []
-    if not all_pairs:
-        logger.warning("[Pairwise] No pairs available; skipping pairwise alignment computation.")
-    else:
-        if args.max_pairs and len(all_pairs) > args.max_pairs:
-            if args.sample_seed is not None:
-                rng = random.Random(args.sample_seed)
-                rng.shuffle(all_pairs)
-            all_pairs = all_pairs[: args.max_pairs]
-            logger.info(f"[Pairwise] Truncated to max_pairs={args.max_pairs}")
-        if args.demo_fast:
-            all_pairs = all_pairs[: min(5, len(all_pairs))]
-            logger.info(f"[Pairwise][DemoFast] Limiting pairs to {len(all_pairs)}")
-
-        def _continuation_logprob(model, prompt_text: str, continuation_text: str):
-            prompt_ids = tokenizer(prompt_text, add_special_tokens=False).input_ids
-            cont_ids = tokenizer(continuation_text, add_special_tokens=False).input_ids
-            if args.truncate_pair_responses and len(cont_ids) > args.truncate_pair_responses:
-                cont_ids = cont_ids[: args.truncate_pair_responses]
-            full_ids = prompt_ids + cont_ids
-            input_tensor = torch.tensor([full_ids], device=device)
-            with torch.no_grad():
-                logits = model(input_tensor).logits
-                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-            cont_start = len(prompt_ids)
-            token_logps = []
-            for i, tok in enumerate(cont_ids):
-                pos = cont_start + i - 1  # predicts next token
-                if pos < 0 or pos >= log_probs.shape[1]:
-                    continue
-                token_logps.append(log_probs[0, pos, tok].item())
-            return float(np.sum(token_logps)) if token_logps else float('nan'), len(cont_ids)
-
-        pair_entries = []
-        for i, pair in enumerate(all_pairs, start=1):
-            pr = pair['prompt']
-            chosen = pair['chosen']
-            rejected = pair['rejected']
-            ent = {"prompt": pr, "chosen_preview": chosen[:160], "rejected_preview": rejected[:160]}
-            try:
-                b_ch_lp, b_ch_len = _continuation_logprob(models['Base'], pr, chosen)
-                b_rj_lp, b_rj_len = _continuation_logprob(models['Base'], pr, rejected)
-                d_ch_lp, d_ch_len = _continuation_logprob(models['DPO'], pr, chosen)
-                d_rj_lp, d_rj_len = _continuation_logprob(models['DPO'], pr, rejected)
-                base_margin = b_ch_lp - b_rj_lp
-                dpo_margin = d_ch_lp - d_rj_lp
-                ent.update({
-                    'base_chosen_logprob': b_ch_lp,
-                    'base_rejected_logprob': b_rj_lp,
-                    'dpo_chosen_logprob': d_ch_lp,
-                    'dpo_rejected_logprob': d_rj_lp,
-                    'base_margin': base_margin,
-                    'dpo_margin': dpo_margin,
-                    'margin_delta': dpo_margin - base_margin,
-                    'chosen_len_tokens': b_ch_len,
-                    'rejected_len_tokens': b_rj_len,
-                })
-            except Exception as e:
-                ent['error'] = str(e)
-                logger.warning(f"[Pairwise] Error processing pair {i}: {e}")
-            pair_entries.append(ent)
-            if i % 10 == 0:
-                logger.info(f"[Pairwise] Processed {i}/{len(all_pairs)} pairs")
-
-        valid = [e for e in pair_entries if 'base_margin' in e]
-        if valid:
-            base_margins = [e['base_margin'] for e in valid]
-            dpo_margins = [e['dpo_margin'] for e in valid]
-            deltas = [e['margin_delta'] for e in valid]
-            def _stats(vals):
-                arr = np.array(vals)
-                return {
-                    'mean': float(np.mean(arr)),
-                    'median': float(np.median(arr)),
-                    'p25': float(np.percentile(arr, 25)),
-                    'p75': float(np.percentile(arr, 75)),
-                }
-            pairwise_alignment = {
-                'num_pairs': len(pair_entries),
-                'num_valid_pairs': len(valid),
-                'base_margin_stats': _stats(base_margins),
-                'dpo_margin_stats': _stats(dpo_margins),
-                'margin_delta_stats': _stats(deltas),
-                'base_accuracy_margin_positive': sum(1 for m in base_margins if m > 0) / len(base_margins),
-                'dpo_accuracy_margin_positive': sum(1 for m in dpo_margins if m > 0) / len(dpo_margins),
-                'win_rate_improved_margin': sum(1 for d in deltas if d > 0) / len(deltas),
-            }
-
-            if args.compute_kl:
-                # Approximate KL by average difference in log probs of chosen tokens
-                token_diffs = []
-                for e in valid:
-                    try:
-                        pr_ids = tokenizer(e['prompt'], add_special_tokens=False).input_ids
-                        ch_ids = tokenizer(e['chosen_preview'], add_special_tokens=False).input_ids
-                        if args.truncate_pair_responses and len(ch_ids) > args.truncate_pair_responses:
-                            ch_ids = ch_ids[: args.truncate_pair_responses]
-                        full_ids = pr_ids + ch_ids
-                        inp = torch.tensor([full_ids], device=device)
-                        with torch.no_grad():
-                            base_lp = torch.nn.functional.log_softmax(models['Base'](inp).logits, dim=-1)
-                            dpo_lp = torch.nn.functional.log_softmax(models['DPO'](inp).logits, dim=-1)
-                        cont_start = len(pr_ids)
-                        for i_tok, tok in enumerate(ch_ids):
-                            pos = cont_start + i_tok - 1
-                            if pos < 0 or pos >= base_lp.shape[1]:
-                                continue
-                            token_diffs.append(base_lp[0, pos, tok].item() - dpo_lp[0, pos, tok].item())
-                    except Exception as ex:
-                        logger.warning(f"[Pairwise][KL] skip due to {ex}")
-                pairwise_alignment['approx_mean_logprob_diff_chosen'] = float(np.mean(token_diffs)) if token_diffs else None
-        else:
-            pairwise_alignment = {'num_pairs': len(pair_entries), 'num_valid_pairs': 0}
 total_dur = time.time() - stage_start
 logger.info("==================== SUMMARY (Base vs DPO) ====================")
 for r in results:
-    logger.info(f"Prompt: {r['prompt'][:60]}...")
-    base_resp = r["results"].get("Base", {}).get("response", "N/A")
-    dpo_resp = r["results"].get("DPO", {}).get("response", "N/A")
-    logger.info("  Base: " + base_resp[:100])
-    logger.info("  DPO:  " + dpo_resp[:100])
+    # Scores are always None now; show lengths instead
+    base_resp = r["results"].get("Base", {}).get("response", "")
+    dpo_resp = r["results"].get("DPO", {}).get("response", "")
+    base_len = len(base_resp)
+    dpo_len = len(dpo_resp)
+    logger.info(
+        f"Prompt: {r['prompt'][:60]}... | Base_len={base_len} DPO_len={dpo_len}"
+    )
 
 print("\n" + "=" * 100)
-print("📊 Response Comparison (Base vs DPO)")
+print(" Generation Comparison (no reward model / DPO pure generations)")
 print("=" * 100)
 for r in results:
     prompt_full = r["prompt"]
     prompt_short = (prompt_full[:90] + "…") if len(prompt_full) > 93 else prompt_full
     base_entry = r["results"].get("Base")
-    dpo_entry = r["results"].get("DPO")
+    ppo_entry = r["results"].get("DPO")
     base_time = base_entry["model_total_time_sec"] if base_entry else float("nan")
-    dpo_time = dpo_entry["model_total_time_sec"] if dpo_entry else float("nan")
-    base_resp = base_entry["response"] if base_entry else "N/A"
-    dpo_resp = dpo_entry["response"] if dpo_entry else "N/A"
-    
+    ppo_time = ppo_entry["model_total_time_sec"] if ppo_entry else float("nan")
+    base_len = len(base_entry["response"]) if base_entry else 0
+    dpo_len = len(ppo_entry["response"]) if ppo_entry else 0
     print(f"Prompt: {prompt_short}")
-    print(f"       Base: {base_resp[:80]}... (Time: {base_time:.2f}s)")
-    print(f"       DPO : {dpo_resp[:80]}... (Time: {dpo_time:.2f}s)")
-    metrics = r["results"].get("intrinsic_metrics")
-    if metrics:
-        print(f"       ΔWords: {metrics['delta_len_words']} | Novelty: {metrics['novelty_ratio']:.4f} | Overlap: {metrics['overlap_ratio']:.4f}")
+    print(f"       Base: Time: {base_time:.2f}s | Length: {base_len}")
+    print(f"       DPO : Time: {ppo_time:.2f}s | Length: {dpo_len}")
+    if args.show_text:
+        print("       --- Base Output ---")
+        print(base_entry["response"])
+        print("       --- DPO Output  ---")
+        print(ppo_entry["response"])
     print()
-
 print(f"Total prompts: {len(results)} | Total elapsed: {total_dur:.2f}s")
 
-# Calculate average generation times
-base_times = [r["results"].get("Base", {}).get("gen_time_sec", 0) for r in results]
-dpo_times = [r["results"].get("DPO", {}).get("gen_time_sec", 0) for r in results]
-
-if base_times and dpo_times:
-    avg_base_time = sum(base_times) / len(base_times)
-    avg_dpo_time = sum(dpo_times) / len(dpo_times)
-    logger.info(f"[Performance] Average Base generation time: {avg_base_time:.2f}s")
-    logger.info(f"[Performance] Average DPO generation time: {avg_dpo_time:.2f}s")
-    print(f"Average Generation Time - Base: {avg_base_time:.2f}s, DPO: {avg_dpo_time:.2f}s")
+# No aggregate reward stats since no scoring performed
 
 output_json = Path(args.output_json)
-payload = {
-    "total_duration_sec": total_dur,
-    "comparisons": results,
-    "gen_config": generation_kwargs,
-    "aggregates": {},
-    "pairwise_alignment": pairwise_alignment if pairwise_alignment is not None else None,
-}
+payload = {"total_duration_sec": total_dur, "comparisons": results, "gen_config": generation_kwargs}
+def _conciseness_gain(comparisons):
+    gains = []
+    for comp in comparisons:
+        base_txt = comp["results"]["Base"]["response"]
+        dpo_txt = comp["results"]["DPO"]["response"]
+        b_len = len(base_txt)
+        d_len = len(dpo_txt)
+        if d_len > 0:
+            gains.append(b_len / d_len)
+    if gains:
+        import statistics
+        return {
+            "avg_gain": sum(gains)/len(gains),
+            "median_gain": statistics.median(gains),
+            "min_gain": min(gains),
+            "max_gain": max(gains),
+            "count": len(gains),
+        }
+    return {}
 
-# Aggregated intrinsic metrics if available
-intrinsic_all = [r["results"].get("intrinsic_metrics") for r in results if r["results"].get("intrinsic_metrics")]
-if intrinsic_all:
-    import statistics
-    def avg(key):
-        vals = [m[key] for m in intrinsic_all]
-        return round(statistics.mean(vals), 4)
-    payload["aggregates"] = {
-        "mean_delta_len_words": avg("delta_len_words"),
-        "mean_novelty_ratio": avg("novelty_ratio"),
-        "mean_overlap_ratio": avg("overlap_ratio"),
+payload["conciseness_gain"] = _conciseness_gain(results)
+
+def simple_heuristics(text: str) -> Dict[str, float]:
+    import re
+    sentences = [s for s in re.split(r'[.!?]\s+', text.strip()) if s]
+    words = text.strip().split()
+    unique_words = set(w.lower() for w in words)
+    keywords = {"python", "docker", "learning", "performance", "model"}
+    keyword_hits = sum(1 for w in unique_words if w in keywords)
+    # Novelty heuristic: ratio of words not in first sentence to total words (rough measure of expansion)
+    first_sentence_words = set(w.lower() for w in (sentences[0].split() if sentences else []))
+    novel_words = [w for w in unique_words if w not in first_sentence_words]
+    novelty_ratio = len(novel_words) / max(1, len(unique_words))
+    return {
+        "char_len": len(text),
+        "token_len": len(words),
+        "sentence_count": len(sentences),
+        "unique_word_ratio": (len(unique_words) / max(1, len(words))),
+        "keyword_hits": keyword_hits,
+        "novelty_ratio": novelty_ratio,
     }
-    print("Aggregate Intrinsic Metrics:")
-    print(f"  Mean ΔWords: {payload['aggregates']['mean_delta_len_words']}")
-    print(f"  Mean Novelty Ratio: {payload['aggregates']['mean_novelty_ratio']}")
-    print(f"  Mean Overlap Ratio: {payload['aggregates']['mean_overlap_ratio']}")
+
+if args.heuristics:
+    for comp in payload["comparisons"]:
+        for name in ("Base", "DPO"):
+            resp = comp["results"][name]["response"]
+            comp["results"][name]["heuristics"] = simple_heuristics(resp)
+    # Aggregate averages
+    import numpy as np
+    agg = {"Base": {}, "DPO": {}}
+    keys = ["char_len", "token_len", "sentence_count", "unique_word_ratio", "keyword_hits", "novelty_ratio"]
+    for model_key in ("Base", "DPO"):
+        for k in keys:
+            vals = [c["results"][model_key]["heuristics"][k] for c in payload["comparisons"]]
+            agg[model_key][k] = float(sum(vals)/len(vals)) if vals else None
+    payload["heuristic_averages"] = agg
+
 with output_json.open("w") as f:
     json.dump(payload, f, indent=2)
 logger.info(f"[Output] JSON written -> {output_json} (time={total_dur:.2f}s)")

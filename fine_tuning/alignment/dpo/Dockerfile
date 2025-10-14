@@ -27,11 +27,12 @@ RUN pip install git+https://github.com/HabanaAI/DeepSpeed.git@1.21.0
 # Create directory structure
 RUN mkdir -p /workspace/alignment/dpo
 
-# Copy the current directory contents into the container
+# Copy all files from current directory (ppo) to container
 COPY . /workspace/alignment/dpo/
 
-# Set the working directory
+# Set working directory to the copied files
 WORKDIR /workspace/alignment/dpo
 
 # Default command
 CMD ["/bin/bash"]
+
